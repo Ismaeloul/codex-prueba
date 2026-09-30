@@ -3,7 +3,7 @@ id: codex-prueba-ace-stream-neo
 category: media
 icon: "https://raw.githubusercontent.com/Ismaeloul/codex-prueba/main/codex-prueba-ace-stream-neo/icon.svg"
 name: Ace Stream Neo V3 - Codex Prueba
-version: "0.8.7"
+version: "0.8.8"
 tagline: Prueba aislada del reproductor AceStream y de Xtream Codes
 description: >-
   Tienda de prueba independiente para validar Ace Stream Neo V3 en Umbrel.
@@ -13,12 +13,11 @@ description: >-
   episodios de cada serie y reproducir formatos habituales desde el servidor local.
   Usa una app ID, datos y contenedores separados del reproductor original.
 releaseNotes: >-
-  Versión 0.8.7: Pelis y Series pregunta qué idiomas incluir y carga solo las
-  categorías elegidas; separa Español (España) de Español latinoamericano y permite
-  editar la selección. Añade portadas, fichas Xtream con sinopsis, género, año,
-  valoración y reparto cuando el proveedor los facilita, además de logos de canales.
-  Las imágenes pasan por el servidor local y tienen fallback genérico. Conserva la
-  corrección de nginx y el aislamiento de la tienda de pruebas de 0.8.6.
+  Versión 0.8.8: los controles del reproductor se ocultan tras 1,2 s sin movimiento
+  y casi al salir con el ratón; pausado conserva los controles. Mantiene Pelis y
+  Series por categorías e idioma, distingue Español (España) y Español
+  latinoamericano, e incluye carátulas, logos y metadatos disponibles del proveedor.
+  Conserva la reproducción por hashes y el aislamiento del store de prueba.
 developer: Ismaeloul
 website: https://github.com/Ismaeloul/codex-prueba
 dependencies: []

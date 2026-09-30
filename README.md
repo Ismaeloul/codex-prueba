@@ -14,9 +14,14 @@ Después instala **Ace Stream Neo V3 - Codex Prueba** desde esta tienda.
 
 La app de prueba usa el ID codex-prueba-ace-stream-neo, su propio directorio de datos de Umbrel y nombres de contenedor exclusivos. Su acceso web usa el puerto 7793 y el motor AceStream publica el puerto P2P 8623; la app original conserva sus puertos. No incluye bases de datos, listas IPTV, credenciales Xtream ni datos locales del usuario.
 
-**Estado de Pelis y Series:** la versión 0.8.7 carga películas y series de una cuenta Xtream configurada en Ajustes → IPTV. Antes de pedir títulos, enseña las categorías y permite elegir idiomas; distingue **Español (España)** de **Español latinoamericano**, recuerda la selección en ese navegador y deja editarla. Después consulta solo las categorías asignadas a esos idiomas. Permite buscar, filtrar por tipo/categoría/idioma y explorar episodios. Las carátulas, los logos y los metadatos Xtream (año, valoración, género, sinopsis, dirección y reparto) aparecen cuando el proveedor los publica; si falta una imagen, se ve el cartel genérico. Las imágenes las sirve el backend local y no se envían URL del proveedor al navegador. Los formatos MP4 y WebM se sirven con soporte de Range; MKV, AVI y TS se remuxean a MP4 con ffmpeg para el navegador. Los VOD HLS y los códecs no compatibles con el navegador pueden requerir trabajo posterior.
+**Estado de Pelis y Series:** la versión 0.8.8 carga películas y series de una cuenta Xtream configurada en Ajustes → IPTV. Antes de pedir títulos, enseña las categorías y permite elegir idiomas; distingue **Español (España)** de **Español latinoamericano**, recuerda la selección en ese navegador y deja editarla. Después consulta solo las categorías asignadas a esos idiomas. Permite buscar, filtrar por tipo/categoría/idioma y explorar episodios. Las carátulas, los logos y los metadatos Xtream (año, valoración, género, sinopsis, dirección y reparto) aparecen cuando el proveedor los publica; si falta una imagen, se ve el cartel genérico. Las imágenes las sirve el backend local y no se envían URL del proveedor al navegador. Los formatos MP4 y WebM se sirven con soporte de Range; MKV, AVI y TS se remuxean a MP4 con ffmpeg para el navegador. Los VOD HLS y los códecs no compatibles con el navegador pueden requerir trabajo posterior.
 
-El código fuente de esta actualización se puede revisar en [patches/v0.8.7-iptv-vod-artwork.patch](patches/v0.8.7-iptv-vod-artwork.patch). Se aplica sobre `Ismaeloul/umbrel-app-store`, commit `28adf272bc32ed5eeb1626c618d31d110c35b5c6`, sin modificar la rama principal de la app original.
+El código fuente de esta actualización se puede revisar en [patches/v0.8.8-player-controls-latency.patch](patches/v0.8.8-player-controls-latency.patch). Es acumulativo y se aplica sobre `Ismaeloul/umbrel-app-store`, commit `28adf272bc32ed5eeb1626c618d31d110c35b5c6`, sin modificar la rama principal de la app original.
+
+## Actualización 0.8.8
+
+- **Controles más ágiles:** mientras se reproduce, los controles se ocultan tras 1,2 s sin movimiento del ratón y a los 250 ms al salir del reproductor. La transición visual dura 150 ms. Al pausar, siguen visibles; el teclado y los menús abiertos conservan el foco y la visibilidad.
+- **Sin cambiar el stream:** este ajuste solo afecta a la interfaz. No modifica la calidad, el buffer ni el protocolo de los streams Ace Stream por hash o de IPTV.
 
 ## Actualización 0.8.7
 
@@ -41,4 +46,4 @@ Referencias consultadas: [cliente Xtream de netv](https://github.com/jvdillon/ne
 
 La compilación de web/backend y las comprobaciones de tipos se completaron. El empaquetado comprueba que los destinos nginx pertenecen a esta app y verifica los hashes. La carga y reproducción con una cuenta real en Umbrel quedan pendientes de validación; el acceso remoto disponible exige iniciar sesión en Umbrel.
 
-Para reconstruir, preparar el código base con el parche acumulativo `patches/v0.8.6-vod.patch` y sus dependencias; después ejecutar `node scripts/build-release.mjs <ruta-del-codigo>`. El script no sobrescribe versiones existentes y rechaza un nginx que apunte fuera de la app de prueba.
+Para reconstruir, preparar el código base con el parche acumulativo de esta versión y sus dependencias; después ejecutar `node scripts/build-release.mjs <ruta-del-codigo>`. El script no sobrescribe versiones existentes y rechaza un nginx que apunte fuera de la app de prueba.

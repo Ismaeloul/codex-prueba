@@ -1,0 +1,3392 @@
+diff --git a/ace-player-neo/apps/server/build.mjs b/ace-player-neo/apps/server/build.mjs
+--- a/ace-player-neo/apps/server/build.mjs
++++ b/ace-player-neo/apps/server/build.mjs
+@@ -70,6 +70,7 @@
+     // Un punto de entrada fuera de apps/server (los tests usan uno mínimo en
+     // una carpeta temporal) resuelve igualmente fastify, pino, zod…
+     nodePaths: [path.join(SERVER_DIR, 'node_modules'), path.join(MONOREPO_DIR, 'node_modules')],
++    alias: { '@ace/shared': '../../packages/shared/src/index.ts' },
+     define: {
+       __APP_VERSION__: JSON.stringify(version),
+       'import.meta.url': '__ace_import_meta_url',
+diff --git a/ace-player-neo/apps/server/tsconfig.json b/ace-player-neo/apps/server/tsconfig.json
+--- a/ace-player-neo/apps/server/tsconfig.json
++++ b/ace-player-neo/apps/server/tsconfig.json
+@@ -3,6 +3,7 @@
+   "extends": "../../tsconfig.base.json",
+   "compilerOptions": {
+     "noEmit": true,
++    "paths": { "@ace/shared": ["../../packages/shared/src/index.ts"] },
+     "types": ["node"]
+   },
+   "include": ["src", "test", "scripts", "vitest.config.ts"],
+diff --git a/ace-player-neo/apps/server/src/app.ts b/ace-player-neo/apps/server/src/app.ts
+--- a/ace-player-neo/apps/server/src/app.ts
++++ b/ace-player-neo/apps/server/src/app.ts
+@@ -118,7 +118,7 @@
+  * (docs/iptv.md §14.2) o en la pestaña IPTV de Canales (§16.2): ni en un
+  * 400 se escribe en el registro.
+  */
+-const QUIET_QUERY_ROUTES: ReadonlySet<string> = new Set(['iptvChannels', 'iptvBrowse']);
++const QUIET_QUERY_ROUTES: ReadonlySet<string> = new Set(['iptvChannels', 'iptvBrowse', 'iptvVodBrowse']);
+ 
+ /** La URL para el registro: redactada y, en esas rutas, sin la consulta. */
+ export function loggedUrl(url: string, routeId: string | undefined): string {
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/routes.ts b/ace-player-neo/apps/server/src/modules/iptv/routes.ts
+--- a/ace-player-neo/apps/server/src/modules/iptv/routes.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/routes.ts
+@@ -32,6 +32,11 @@
+   'iptvDelete',
+   'iptvChannels',
+   'iptvBrowse',
++  'iptvVodBrowse',
++  'iptvVodSeries',
++  'iptvVodMovie',
++  'iptvVodVideo',
++  'iptvImage',
+ ];
+ 
+ export function registerLegacyRoutes(_router: LegacyRouter, _services: Services): void {}
+@@ -46,4 +51,23 @@
+     services.iptv.searchChannels(input.query.q, input.query.limit),
+   );
+   router.handle('iptvBrowse', (input) => services.iptv.browse(input.query));
++  router.handle('iptvVodBrowse', (input) => services.iptv.vodBrowse(input.query));
++  router.handle('iptvVodSeries', (input, ctx) =>
++    services.iptv.vodSeries(input.params.id, ctx.signal),
++  );
++  router.handle('iptvVodMovie', (input, ctx) =>
++    services.iptv.vodMovie(input.params.id, ctx.signal),
++  );
++  router.handle('iptvVodVideo', async (input, ctx) => {
++    const header = ctx.request.headers.range;
++    await services.iptv.vodVideo(
++      input.params.id,
++      ctx.reply,
++      Array.isArray(header) ? header[0] : header,
++      ctx.signal,
++    );
++  });
++  router.handle('iptvImage', async (input, ctx) => {
++    await services.iptv.image(input.params.id, ctx.reply, ctx.signal);
++  });
+ }
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/service.ts b/ace-player-neo/apps/server/src/modules/iptv/service.ts
+--- a/ace-player-neo/apps/server/src/modules/iptv/service.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/service.ts
+@@ -18,6 +18,7 @@
+ import { mkdirSync } from 'node:fs';
+ import path from 'node:path';
+ import { randomBytes } from 'node:crypto';
++import { spawn } from 'node:child_process';
+ import {
+   ERROR_CATALOG,
+   IPTV_BROWSE,
+@@ -49,8 +50,13 @@
+   type IptvStatus,
+   type IptvUpdateBody,
+   type IptvView,
++  type IptvVodBrowseResponse,
++  type IptvVodQuery,
++  type IptvVodSeriesResponse,
++  type IptvVodMovieResponse,
+   type SearchResult,
+ } from '@ace/shared';
++import type { FastifyReply } from 'fastify';
+ import type { TimerHandle } from '../../core/clock.js';
+ import { AppError, errorCodeOf, isAppError } from '../../core/errors.js';
+ import type { IptvKeys } from '../../config/keys.js';
+@@ -105,6 +111,8 @@
+ } from './search.js';
+ import { createIptvRelay, type IptvRelayImpl, type RelayVariant } from './relay.js';
+ import { IptvFiles } from './store.js';
++import { xtreamMovieInfo, xtreamSeriesEpisodes, xtreamVodUrl } from './vod.js';
++import { VodCatalog, emptyVodProgress } from './vod-catalog.js';
+ import type {
+   IptvCheckOptions,
+   IptvCheckResult,
+@@ -130,6 +138,31 @@
+   xtreamUserInfo,
+   type XtreamAccount,
+ } from './xtream.js';
++
++function imageMime(bytes: Buffer): string | null {
++  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff)
++    return 'image/jpeg';
++  if (
++    bytes.length >= 8 &&
++    bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
++  )
++    return 'image/png';
++  if (bytes.length >= 6 && ['GIF87a', 'GIF89a'].includes(bytes.toString('ascii', 0, 6)))
++    return 'image/gif';
++  if (
++    bytes.length >= 12 &&
++    bytes.toString('ascii', 0, 4) === 'RIFF' &&
++    bytes.toString('ascii', 8, 12) === 'WEBP'
++  )
++    return 'image/webp';
++  if (
++    bytes.length >= 12 &&
++    bytes.toString('ascii', 4, 8) === 'ftyp' &&
++    ['avif', 'avis'].includes(bytes.toString('ascii', 8, 12))
++  )
++    return 'image/avif';
++  return null;
++}
+ 
+ type Secrets =
+   | { readonly kind: 'm3u'; readonly url: string }
+@@ -262,6 +295,15 @@
+    * memoria y con tope; los ids ya llevan el proveedor dentro (§4.1).
+    */
+   private readonly measured = new Map<string, IptvQuality>();
++  private vodState: VodCatalog | null = null;
++  private readonly vodStreams = new Set<AbortController>();
++
++  private clearVod(): void {
++    this.vodState?.dispose();
++    this.vodState = null;
++    for (const controller of this.vodStreams) controller.abort();
++    this.vodStreams.clear();
++  }
+   /** Índice de la pestaña IPTV del catálogo vigente (§16.5): se monta al aplicar y al cargar. */
+   private browseState: {
+     readonly catalog: Catalog;
+@@ -405,6 +447,7 @@
+ 
+   async stop(): Promise<void> {
+     this.stopped = true;
++    this.clearVod();
+     this.unsubscribe?.();
+     this.unsubscribe = null;
+     for (const timer of this.timers.values()) this.deps.clock.clearTimeout(timer);
+@@ -734,6 +777,7 @@
+     this.lan = lan;
+     this.expiredSince = null;
+     this.accountCheckedAt = account ? this.deps.clock.now() : 0;
++    this.clearVod();
+     if (!sameProvider) {
+       /* Lo que suena del proveedor anterior se corta (su conexión y sus credenciales). */
+       if (current) this.revoke('iptv_removed');
+@@ -863,6 +907,7 @@
+     const pausing = body.enabled === false && current.enabled;
+     const resuming = body.enabled === true && !current.enabled;
+     if (pausing) this.abortWork('iptv_disabled');
++    if (pausing) this.clearVod();
+     await this.persist((draft) => {
+       if (!draft.provider) return;
+       if (body.name !== undefined) draft.provider.name = body.name.trim() || IPTV_DEFAULT_NAME;
+@@ -903,6 +948,7 @@
+     this.catalog = null;
+     this.guide = null;
+     this.guideCache.clear();
++    this.clearVod();
+     this.redactor.reset();
+     this.syncing = false;
+     this.expiredSince = null;
+@@ -1028,6 +1074,7 @@
+               tvgShift: null,
+               userAgent: null,
+               referrer: null,
++              logoUrl: stream.streamIcon,
+             });
+           },
+           { policy, signal },
+@@ -1070,6 +1117,7 @@
+                 referrer: entry.referrer,
+                 tvgCountry: entry.tvgCountry,
+                 tvgLanguage: entry.tvgLanguage,
++                logoUrl: entry.logoUrl,
+               });
+             },
+           });
+@@ -1494,6 +1542,7 @@
+       return {
+         id: first.id,
+         title: (group.best.display || group.key).slice(0, 120),
++        iconId: first.logoUrl ? first.id : null,
+         quality: this.qualityOf(first),
+         qualities,
+         country: group.bucket || null,
+@@ -1590,6 +1639,289 @@
+       names.set(category.index, name);
+     }
+     return name;
++  }
++
++  private loadVod(): VodCatalog {
++    this.ensureLoaded();
++    const record = this.record;
++    const secrets = this.secrets;
++    if (!record?.enabled || secrets?.kind !== 'xtream') throw new AppError('iptv_not_configured');
++    if (this.vodState?.providerId === record.id && this.vodState.revision === record.revision)
++      return this.vodState;
++    this.vodState?.dispose();
++    const keys = this.ensureKeys();
++    this.vodState = new VodCatalog(record.id, record.revision, {
++      net: this.deps.net,
++      credentials: secrets,
++      policy: this.policy(),
++      now: () => this.deps.clock.now(),
++      id: (key) => iptvChannelId(keys, record.id, key),
++      redact: (text) => this.redact(text),
++    });
++    return this.vodState;
++  }
++
++  async vodBrowse(query: IptvVodQuery): Promise<IptvVodBrowseResponse> {
++    this.ensureLoaded();
++    const inactive: IptvVodBrowseResponse = {
++      active: false,
++      loading: false,
++      progress: { peliculas: emptyVodProgress(), series: emptyVodProgress() },
++      provider: this.record?.name ?? '',
++      total: 0,
++      movies: 0,
++      series: 0,
++      items: [],
++      categories: [],
++      languages: [],
++      nextOffset: null,
++    };
++    if (!this.record?.enabled || this.secrets?.kind !== 'xtream') return inactive;
++    const state = this.loadVod();
++    state.ensure(query.kind, query.phase, query.categories, query.retry);
++    const items = [...state.byId.values()];
++    const selectedCategories = query.phase === 'items' ? new Set(query.categories) : null;
++    const selectedItems = items.filter(
++      (item) => !selectedCategories || selectedCategories.has(item.categoryId),
++    );
++    const kindItems =
++      query.kind === 'todos'
++        ? selectedItems
++        : selectedItems.filter((item) => item.kind === query.kind);
++    const progress = { peliculas: state.progress('peliculas'), series: state.progress('series') };
++    const loading = (
++      query.kind === 'todos' ? Object.values(progress) : [progress[query.kind]]
++    ).some((part) => part.status === 'loading');
++    const languages = new Set<string>();
++    for (const item of kindItems) if (item.language) languages.add(item.language);
++    const fold = (text: string) =>
++      text
++        .normalize('NFD')
++        .replace(/[\u0300-\u036f]/g, '')
++        .toLowerCase();
++    const needle = fold(query.q.trim());
++    const filtered = kindItems.filter(
++      (item) =>
++        (!query.category || item.categoryId === query.category) &&
++        (!query.language ||
++          (query.language === '__sin-especificar__'
++            ? !item.language
++            : item.language === query.language)) &&
++        (!needle || fold(`${item.title} ${item.category} ${item.language ?? ''}`).includes(needle)),
++    );
++    const page = filtered.slice(query.offset, query.offset + query.limit);
++    return {
++      active: true,
++      loading,
++      progress,
++      provider: this.record.name,
++      total: filtered.length,
++      movies: selectedItems.filter((item) => item.kind === 'peliculas').length,
++      series: selectedItems.filter((item) => item.kind === 'series').length,
++      items: page.map(({ sourceId: _sourceId, ...item }) => item),
++      categories: state.categories(query.kind),
++      languages: [...languages].sort((a, b) => a.localeCompare(b, 'es')),
++      nextOffset: query.offset + page.length < filtered.length ? query.offset + page.length : null,
++    };
++  }
++
++  async vodSeries(id: string, signal?: AbortSignal): Promise<IptvVodSeriesResponse> {
++    const state = this.loadVod();
++    const series = state.byId.get(id.toLowerCase());
++    if (!series || series.kind !== 'series') throw new AppError('iptv_gone');
++    const secrets = this.secrets;
++    if (secrets?.kind !== 'xtream') throw new AppError('iptv_disabled');
++    const raw = await xtreamSeriesEpisodes(
++      this.deps.net,
++      secrets,
++      series.sourceId,
++      this.policy(),
++      signal,
++    );
++    if (this.vodState !== state) throw new AppError('iptv_gone');
++    const episodes = raw.episodes.map((episode) => {
++      const episodeId = iptvChannelId(
++        this.ensureKeys(),
++        state.providerId,
++        `vod:episode:${series.sourceId}:${episode.sourceId}`,
++      );
++      state.episodes.set(episodeId, { sourceId: episode.sourceId, extension: episode.extension });
++      return {
++        id: episodeId,
++        title: episode.title,
++        season: episode.season,
++        episode: episode.episode,
++        extension: episode.extension,
++        posterId: state.registerImage(`${episodeId}`, episode.posterUrl),
++      };
++    });
++    return {
++      title: series.title,
++      posterId: state.registerImage(id, raw.metadata.posterUrl),
++      year: raw.metadata.year,
++      rating: raw.metadata.rating,
++      genre: raw.metadata.genre,
++      plot: raw.metadata.plot,
++      director: raw.metadata.director,
++      cast: raw.metadata.cast,
++      backdropId: state.registerImage(`${id}:backdrop`, raw.metadata.backdropUrl),
++      episodes,
++    };
++  }
++
++  async vodMovie(id: string, signal?: AbortSignal): Promise<IptvVodMovieResponse> {
++    const state = this.loadVod();
++    const movie = state.byId.get(id.toLowerCase());
++    if (!movie || movie.kind !== 'peliculas') throw new AppError('iptv_gone');
++    const secrets = this.secrets;
++    if (secrets?.kind !== 'xtream') throw new AppError('iptv_disabled');
++    const metadata = await xtreamMovieInfo(
++      this.deps.net,
++      secrets,
++      movie.sourceId,
++      this.policy(),
++      signal,
++    );
++    if (this.vodState !== state) throw new AppError('iptv_gone');
++    return {
++      posterId: state.registerImage(id, metadata.posterUrl) ?? movie.posterId,
++      backdropId: state.registerImage(`${id}:backdrop`, metadata.backdropUrl),
++      year: metadata.year ?? movie.year,
++      rating: metadata.rating ?? movie.rating,
++      genre: metadata.genre ?? movie.genre,
++      plot: metadata.plot,
++      director: metadata.director,
++      cast: metadata.cast,
++    };
++  }
++
++  async image(id: string, reply: FastifyReply, signal: AbortSignal): Promise<void> {
++    this.ensureLoaded();
++    const vodUrl = this.vodState?.imageUrl(id.toLowerCase()) ?? null;
++    const channelUrl = this.catalog?.get(id)?.logoUrl ?? null;
++    const url = vodUrl ?? channelUrl;
++    if (!url || !this.active()) throw new AppError('iptv_gone');
++    const response = await this.deps.net.fetchBuffer(url, {
++      maxBytes: 2 * 1024 * 1024,
++      totalTimeoutMs: 15_000,
++      idleTimeoutMs: 8_000,
++      headers: { 'User-Agent': IPTV_USER_AGENT },
++      accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.3',
++      iptv: this.policy(),
++      signal,
++    });
++    const bytes = response.body;
++    const type = imageMime(bytes);
++    if (!type) throw new AppError('iptv_bad_list');
++    reply
++      .code(200)
++      .header('content-type', type)
++      .header('content-length', String(bytes.length))
++      .header('cache-control', 'private, max-age=3600')
++      .header('x-content-type-options', 'nosniff')
++      .send(bytes);
++  }
++
++  async vodVideo(
++    id: string,
++    reply: FastifyReply,
++    range: string | undefined,
++    signal: AbortSignal,
++  ): Promise<void> {
++    const state = this.loadVod();
++    const secrets = this.secrets;
++    if (secrets?.kind !== 'xtream') throw new AppError('iptv_disabled');
++    const movie = state.byId.get(id.toLowerCase());
++    const episode = state.episodes.get(id.toLowerCase());
++    if ((!movie || movie.kind !== 'peliculas') && !episode) throw new AppError('iptv_gone');
++    const sourceId = episode?.sourceId ?? movie?.sourceId ?? '';
++    const extension = episode?.extension ?? movie?.extension ?? 'mp4';
++    if (extension === 'm3u8') throw new AppError('iptv_unsupported');
++    const url = xtreamVodUrl(secrets, episode ? 'episode' : 'peliculas', sourceId, extension);
++    const headers: Record<string, string> = { 'User-Agent': IPTV_USER_AGENT };
++    const direct = extension === 'mp4' || extension === 'mov' || extension === 'webm';
++    if (direct && range && /^bytes=\d*-\d*$/.test(range)) headers.Range = range;
++    const controller = new AbortController();
++    this.vodStreams.add(controller);
++    const abort = () => controller.abort();
++    signal.addEventListener('abort', abort, { once: true });
++    let opened: Awaited<ReturnType<IptvDeps['net']['openStream']>>;
++    try {
++      opened = await this.deps.net.openStream(url, {
++        idleMs: direct ? 30_000 : 90_000,
++        headers,
++        iptv: this.policy(),
++        signal: controller.signal,
++      });
++    } catch (error) {
++      this.vodStreams.delete(controller);
++      signal.removeEventListener('abort', abort);
++      throw error;
++    }
++    reply.raw.once('close', () => {
++      opened.body.destroy();
++      controller.abort();
++      this.vodStreams.delete(controller);
++      signal.removeEventListener('abort', abort);
++    });
++    if (!direct) {
++      const ffmpeg = spawn(
++        'ffmpeg',
++        [
++          '-hide_banner',
++          '-loglevel',
++          'error',
++          '-i',
++          'pipe:0',
++          '-map',
++          '0:v:0?',
++          '-map',
++          '0:a:0?',
++          '-sn',
++          '-c:v',
++          'copy',
++          '-c:a',
++          'aac',
++          '-f',
++          'mp4',
++          '-movflags',
++          'frag_keyframe+empty_moov+default_base_moof',
++          'pipe:1',
++        ],
++        { stdio: ['pipe', 'pipe', 'pipe'] },
++      );
++      ffmpeg.stderr.resume();
++      ffmpeg.stdin.on('error', () => opened.body.destroy());
++      ffmpeg.on('error', () => opened.body.destroy());
++      opened.body.pipe(ffmpeg.stdin);
++      const close = () => {
++        opened.body.destroy();
++        ffmpeg.kill();
++      };
++      reply.raw.once('close', close);
++      signal.addEventListener('abort', close, { once: true });
++      reply
++        .code(200)
++        .header('content-type', 'video/mp4')
++        .header('cache-control', 'private, no-store');
++      reply.send(ffmpeg.stdout);
++      return;
++    }
++    const mime =
++      extension === 'mp4' || extension === 'mov'
++        ? 'video/mp4'
++        : extension === 'webm'
++          ? 'video/webm'
++          : 'application/octet-stream';
++    reply
++      .code(opened.status)
++      .header('content-type', mime)
++      .header('cache-control', 'private, no-store');
++    for (const name of ['content-length', 'content-range', 'accept-ranges'] as const) {
++      const value = opened.headers[name];
++      if (typeof value === 'string') reply.header(name, value);
++    }
++    reply.send(opened.body);
+   }
+ 
+   async browse(query: IptvBrowseQuery): Promise<IptvBrowseResponse> {
+@@ -1668,6 +2000,7 @@
+         return {
+           id: best.id,
+           title: (best.display || (index.key[row] as string)).slice(0, 120),
++          iconId: best.logoUrl ? best.id : null,
+           qualities: rowQualities(index, row),
+           country: index.country[row] ?? null,
+           category: (index.categories[index.category[row] as number] as BrowseCategory).id,
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/types.ts b/ace-player-neo/apps/server/src/modules/iptv/types.ts
+--- a/ace-player-neo/apps/server/src/modules/iptv/types.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/types.ts
+@@ -22,11 +22,16 @@
+   IptvSaveBody,
+   IptvUpdateBody,
+   IptvView,
++  IptvVodBrowseResponse,
++  IptvVodMovieResponse,
++  IptvVodSeriesResponse,
++  IptvVodQuery,
+   ResolutionCandidate,
+   ScanJobKind,
+   SearchResult,
+   VerdictState,
+ } from '@ace/shared';
++import type { FastifyReply } from 'fastify';
+ import type { CoreDeps, Lifecycle } from '../../core/module.js';
+ import type { NetClient } from '../net/index.js';
+ import type { StateService } from '../state/index.js';
+@@ -154,6 +159,18 @@
+ }
+ 
+ export interface IptvService extends Lifecycle {
++  /** Catálogo VOD Xtream separado de los canales en directo. */
++  vodBrowse(query: IptvVodQuery): Promise<IptvVodBrowseResponse>;
++  vodSeries(id: string, signal?: AbortSignal): Promise<IptvVodSeriesResponse>;
++  vodMovie(id: string, signal?: AbortSignal): Promise<IptvVodMovieResponse>;
++  vodVideo(
++    id: string,
++    reply: FastifyReply,
++    range: string | undefined,
++    signal: AbortSignal,
++  ): Promise<void>;
++  /** Imagen local segura de un canal o elemento VOD. */
++  image(id: string, reply: FastifyReply, signal: AbortSignal): Promise<void>;
+   /** GET /api/v1/iptv. Nunca devuelve la URL, el usuario ni la contraseña. */
+   view(): Promise<IptvView>;
+   /** PUT /api/v1/iptv: prueba rápida, cifra, guarda (`revision` + 1) y sincroniza de fondo. */
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/catalog.ts b/ace-player-neo/apps/server/src/modules/iptv/catalog.ts
+--- a/ace-player-neo/apps/server/src/modules/iptv/catalog.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/catalog.ts
+@@ -45,6 +45,8 @@
+   readonly tvgCountry?: string | null;
+   /** M3U `tvg-language` tal cual (64 como mucho), o null. */
+   readonly tvgLanguage?: string | null;
++  /** URL de logo externa, guardada solo en el catálogo cifrado. */
++  readonly logoUrl?: string | null;
+ }
+ 
+ /** Una entrada del catálogo (forma fija para no gastar memoria de más). */
+@@ -73,6 +75,8 @@
+     /** M3U `tvg-country` y `tvg-language` (pestaña IPTV, §16.4), o null. */
+     readonly tvgCountry: string | null = null,
+     readonly tvgLanguage: string | null = null,
++    /** Icono Xtream `stream_icon` o M3U `tvg-logo`; no se envía como URL al navegador. */
++    readonly logoUrl: string | null = null,
+   ) {}
+ 
+   /** Nombre para enseñar («DAZN LaLiga»), sin país, adornos, calidad ni reserva. */
+@@ -111,7 +115,7 @@
+   readonly groupOrder?: readonly string[];
+   /**
+    * `[id, título, grupo, tvgId, ref, tvgShift, userAgent, referrer,
+-   * tvgCountry?, tvgLanguage?]` (las dos últimas, solo M3U y si las trae).
++   * tvgCountry?, tvgLanguage?, logoUrl?]` (los últimos campos opcionales).
+    */
+   readonly entries: readonly StoredEntry[];
+ }
+@@ -125,6 +129,19 @@
+       string,
+       string,
+       number | null,
++      string | null,
++      string | null,
++      string | null,
++      string | null,
++    ]
++  | readonly [
++      string,
++      string,
++      string,
++      string,
++      string,
++      number | null,
++      string | null,
+       string | null,
+       string | null,
+       string | null,
+@@ -153,8 +170,8 @@
+     entry.userAgent,
+     entry.referrer,
+   ] as const;
+-  return entry.tvgCountry !== null || entry.tvgLanguage !== null
+-    ? [...base, entry.tvgCountry, entry.tvgLanguage]
++  return entry.tvgCountry !== null || entry.tvgLanguage !== null || entry.logoUrl !== null
++    ? [...base, entry.tvgCountry, entry.tvgLanguage, entry.logoUrl]
+     : base;
+ }
+ 
+@@ -285,6 +302,7 @@
+       false,
+       this.intern(cleanTvgAttribute(channel.tvgCountry)),
+       this.intern(cleanTvgAttribute(channel.tvgLanguage)),
++      this.intern(channel.logoUrl?.slice(0, 2048) ?? null),
+     );
+     this.entries.push(entry);
+     this.byId.set(entry.id, entry);
+@@ -359,6 +377,7 @@
+         true,
+         entry.tvgCountry,
+         entry.tvgLanguage,
++        entry.logoUrl,
+       );
+       replaced.set(entry.id, next);
+       this.byId.set(next.id, next);
+@@ -619,6 +638,7 @@
+         referrer: typeof item[7] === 'string' ? item[7] : null,
+         tvgCountry: typeof item[8] === 'string' ? item[8] : null,
+         tvgLanguage: typeof item[9] === 'string' ? item[9] : null,
++        logoUrl: typeof item[10] === 'string' ? item[10] : null,
+       });
+     }
+     return new Catalog(
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/m3u.ts b/ace-player-neo/apps/server/src/modules/iptv/m3u.ts
+--- a/ace-player-neo/apps/server/src/modules/iptv/m3u.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/m3u.ts
+@@ -41,6 +41,8 @@
+   readonly tvgCountry: string | null;
+   /** `tvg-language` (ídem), o null. */
+   readonly tvgLanguage: string | null;
++  /** `tvg-logo`, solo URLs HTTP(S) absolutas; el servidor las proxifica localmente. */
++  readonly logoUrl: string | null;
+ }
+ 
+ export interface M3uHeader {
+@@ -103,6 +105,19 @@
+ function tvgAttribute(value: string | undefined): string | null {
+   if (!value || CONTROL_RE.test(value)) return null;
+   return value.trim().slice(0, 64) || null;
++}
++
++function imageUrl(value: string | undefined): string | null {
++  if (!value || value.length > 2048 || CONTROL_RE.test(value)) return null;
++  try {
++    const url = new URL(value.trim());
++    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password)
++      return null;
++    url.hash = '';
++    return url.toString();
++  } catch {
++    return null;
++  }
+ }
+ 
+ function parseShift(value: string | undefined): number | null {
+@@ -186,6 +201,7 @@
+     tvgShift: number | null;
+     tvgCountry: string | null;
+     tvgLanguage: string | null;
++    logoUrl: string | null;
+   } | null = null;
+   let extGroup = '';
+   let userAgent: string | null = null;
+@@ -228,6 +244,7 @@
+           tvgShift: parseShift(attributes.get('tvg-shift')),
+           tvgCountry: tvgAttribute(attributes.get('tvg-country')),
+           tvgLanguage: tvgAttribute(attributes.get('tvg-language')),
++          logoUrl: imageUrl(attributes.get('tvg-logo')),
+         };
+         extGroup = '';
+         userAgent = null;
+@@ -258,6 +275,7 @@
+       referrer,
+       tvgCountry: current.tvgCountry,
+       tvgLanguage: current.tvgLanguage,
++      logoUrl: current.logoUrl,
+     };
+     count += 1;
+     if (count > maxChannels) throw new AppError('iptv_too_large');
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/xtream.ts b/ace-player-neo/apps/server/src/modules/iptv/xtream.ts
+--- a/ace-player-neo/apps/server/src/modules/iptv/xtream.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/xtream.ts
+@@ -55,6 +55,7 @@
+   readonly name: string;
+   readonly epgChannelId: string;
+   readonly categoryId: string;
++  readonly streamIcon: string | null;
+ }
+ 
+ export interface XtreamShortEpgItem {
+@@ -322,6 +323,7 @@
+           name: name.slice(0, 200),
+           epgChannelId: looseString(item.epg_channel_id).slice(0, 200),
+           categoryId: streamCategoryId(item),
++          streamIcon: imageUrl(item.stream_icon, credentials.server),
+         });
+       },
+       { maxObjectBytes: IPTV_XTREAM_LIMITS.maxObjectBytes },
+@@ -330,6 +332,22 @@
+     throw toIptvError(error, 'list');
+   }
+   return count;
++}
++
++/** Acepta solo logos raster servibles y nunca convierte un icono en URL autenticada. */
++function imageUrl(value: unknown, base: string): string | null {
++  const text = looseString(value);
++  // eslint-disable-next-line no-control-regex
++  if (!text || text.length > 2048 || /[\u0000-\u001f\u007f]/.test(text)) return null;
++  try {
++    const url = new URL(text, base);
++    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password)
++      return null;
++    url.hash = '';
++    return url.toString();
++  } catch {
++    return null;
++  }
+ }
+ 
+ function base64Text(value: unknown): string {
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/vod.ts b/ace-player-neo/apps/server/src/modules/iptv/vod.ts
+new file mode 100644
+--- /dev/null
++++ b/ace-player-neo/apps/server/src/modules/iptv/vod.ts
+@@ -0,0 +1,327 @@
++import { IPTV_USER_AGENT, IPTV_XTREAM_LIMITS } from '@ace/shared';
++import { AppError } from '../../core/errors.js';
++import type { IptvFetchPolicy, NetClient } from '../net/types.js';
++import { toIptvError } from './errors.js';
++import { parseJsonArrayStream } from './json-array.js';
++import { streamCategoryId, xtreamApiUrl, type XtreamCredentials } from './xtream.js';
++
++const HEADERS = { 'User-Agent': IPTV_USER_AGENT };
++const MAX_VOD_ITEMS = 100_000;
++const MAX_VOD_BYTES = 96 * 1024 * 1024;
++const MAX_EPISODES = 2_000;
++
++export interface RawVodItem {
++  readonly sourceId: string;
++  readonly kind: 'peliculas' | 'series';
++  readonly title: string;
++  readonly categoryId: string;
++  readonly language: string;
++  readonly extension: string | null;
++  readonly posterUrl: string | null;
++  readonly year: string | null;
++  readonly rating: string | null;
++  readonly genre: string | null;
++}
++
++export interface RawVodEpisode {
++  readonly sourceId: string;
++  readonly title: string;
++  readonly season: number;
++  readonly episode: number;
++  readonly extension: string;
++  readonly posterUrl: string | null;
++}
++
++export interface RawVodMetadata {
++  readonly posterUrl: string | null;
++  readonly backdropUrl: string | null;
++  readonly year: string | null;
++  readonly rating: string | null;
++  readonly genre: string | null;
++  readonly plot: string | null;
++  readonly director: string | null;
++  readonly cast: string | null;
++}
++
++const stringOf = (value: unknown): string => {
++  if (typeof value === 'string') return value.trim();
++  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
++  return '';
++};
++
++const numberOf = (value: unknown): number => {
++  const number = Number(value);
++  return Number.isFinite(number) && number >= 0 ? Math.floor(number) : 0;
++};
++
++export const safeVodExtension = (value: unknown): string => {
++  const extension = stringOf(value).toLowerCase().replace(/^\./, '');
++  return /^(mp4|mkv|avi|mov|m3u8|ts|webm)$/.test(extension) ? extension : 'mp4';
++};
++
++export function vodLanguage(...values: string[]): string | null {
++  const text = values
++    .join(' ')
++    .normalize('NFD')
++    .replace(/[\u0300-\u036f]/g, '')
++    .toLowerCase();
++  if (
++    /(?:^|[^a-z])(latino|latam|latinoamerica|latin america|es-419|mexico|mexicano|argentina|argentino|colombia|colombiano|venezuela|chile|peru)(?:$|[^a-z])/.test(
++      text,
++    )
++  )
++    return 'es-419';
++  const patterns: readonly [RegExp, string][] = [
++    [/(?:^|[^a-z])(castellano|espanol|spanish|spain|espana|es-es|esp|spa|es)(?:$|[^a-z])/, 'es-ES'],
++    [/(?:^|[^a-z])(english|ingles|eng|en)(?:$|[^a-z])/, 'en'],
++    [/(?:^|[^a-z])(french|frances|fra|fr)(?:$|[^a-z])/, 'fr'],
++    [/(?:^|[^a-z])(german|aleman|deutsch|ger|de)(?:$|[^a-z])/, 'de'],
++    [/(?:^|[^a-z])(italian|italiano|ita|it)(?:$|[^a-z])/, 'it'],
++    [/(?:^|[^a-z])(brazilian|brasil|brasileiro|pt-br)(?:$|[^a-z])/, 'pt-BR'],
++    [/(?:^|[^a-z])(portuguese|portugues|portugal|pt-pt|por|pt)(?:$|[^a-z])/, 'pt-PT'],
++    [/(?:^|[^a-z])(catalan|catala|cat|ca)(?:$|[^a-z])/, 'ca'],
++    [/(?:^|[^a-z])(arabic|arabe|ara|ar)(?:$|[^a-z])/, 'ar'],
++    [/(?:^|[^a-z])(japanese|japones|jpn|ja)(?:$|[^a-z])/, 'ja'],
++  ];
++  for (const [pattern, code] of patterns) if (pattern.test(text)) return code;
++  return null;
++}
++
++function safeImageUrl(value: unknown, base: string): string | null {
++  const text = stringOf(value);
++  // eslint-disable-next-line no-control-regex
++  if (!text || text.length > 2048 || /[\u0000-\u001f\u007f]/.test(text)) return null;
++  try {
++    const url = new URL(text, base);
++    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password)
++      return null;
++    url.hash = '';
++    return url.toString();
++  } catch {
++    return null;
++  }
++}
++
++const shortText = (value: unknown, max: number): string | null => {
++  const text = stringOf(value)
++    // eslint-disable-next-line no-control-regex
++    .replace(/[\u0000-\u001f\u007f]/g, ' ')
++    .replace(/\s+/g, ' ')
++    .trim();
++  return text ? text.slice(0, max) : null;
++};
++const yearOf = (...values: unknown[]): string | null => {
++  for (const value of values) {
++    const match = /\b(?:19|20)\d{2}\b/.exec(stringOf(value));
++    if (match) return match[0];
++  }
++  return null;
++};
++
++function metadataOf(value: unknown, base: string): RawVodMetadata {
++  const info = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
++  const backdrop = Array.isArray(info.backdrop_path) ? info.backdrop_path[0] : info.backdrop_path;
++  return {
++    posterUrl: safeImageUrl(info.movie_image ?? info.cover ?? info.stream_icon, base),
++    backdropUrl: safeImageUrl(backdrop, base),
++    year: yearOf(info.releaseDate, info.release_date, info.releasedate, info.year),
++    rating: shortText(info.rating_5based ?? info.rating, 12),
++    genre: shortText(info.genre, 160),
++    plot: shortText(info.plot, 4000),
++    director: shortText(info.director, 300),
++    cast: shortText(info.cast, 600),
++  };
++}
++
++export async function xtreamVodCategories(
++  net: NetClient,
++  credentials: XtreamCredentials,
++  action: 'get_vod_categories' | 'get_series_categories',
++  policy: IptvFetchPolicy,
++  signal?: AbortSignal,
++): Promise<Map<string, string>> {
++  try {
++    const response = await net.fetchJson(xtreamApiUrl(credentials, action), {
++      maxBytes: IPTV_XTREAM_LIMITS.liveCategories.maxBytes,
++      totalTimeoutMs: IPTV_XTREAM_LIMITS.liveCategories.totalMs,
++      idleTimeoutMs: IPTV_XTREAM_LIMITS.liveCategories.totalMs,
++      headers: HEADERS,
++      iptv: policy,
++      ...(signal ? { signal } : {}),
++    });
++    const categories = new Map<string, string>();
++    if (!Array.isArray(response.body)) throw new Error('bad_response');
++    for (const raw of response.body) {
++      if (!raw || typeof raw !== 'object') continue;
++      const item = raw as Record<string, unknown>;
++      const id = stringOf(item.category_id);
++      const name = stringOf(item.category_name);
++      if (id && name) categories.set(id.slice(0, 80), name.slice(0, 200));
++    }
++    return categories;
++  } catch (error) {
++    throw toIptvError(error, 'list');
++  }
++}
++
++export async function xtreamVodItems(
++  net: NetClient,
++  credentials: XtreamCredentials,
++  kind: RawVodItem['kind'],
++  policy: IptvFetchPolicy,
++  signal?: AbortSignal,
++  options: { categoryId?: string; onItem?: (item: RawVodItem) => void } = {},
++): Promise<RawVodItem[]> {
++  const action = kind === 'peliculas' ? 'get_vod_streams' : 'get_series';
++  const items: RawVodItem[] = [];
++  try {
++    const response = await net.openStream(
++      xtreamApiUrl(
++        credentials,
++        action,
++        options.categoryId === undefined ? {} : { category_id: options.categoryId },
++      ),
++      {
++        maxBytes: MAX_VOD_BYTES,
++        totalMs: 120_000,
++        idleMs: 25_000,
++        headersMs: 90_000,
++        headers: HEADERS,
++        accept: 'application/json',
++        iptv: { ...policy, maxDecompressedBytes: MAX_VOD_BYTES * 2 },
++        ...(signal ? { signal } : {}),
++      },
++    );
++    let count = 0;
++    const parsed = await parseJsonArrayStream(
++      response.body,
++      (item) => {
++        const sourceId = stringOf(kind === 'peliculas' ? item.stream_id : item.series_id);
++        const title = stringOf(item.name);
++        if (!/^[A-Za-z0-9_-]{1,40}$/.test(sourceId) || !title) return;
++        if (count++ >= MAX_VOD_ITEMS) throw new AppError('iptv_too_large');
++        const entry: RawVodItem = {
++          sourceId,
++          kind,
++          title: title.slice(0, 240),
++          categoryId: (streamCategoryId(item) || options.categoryId || '').slice(0, 80),
++          language: stringOf(item.language).slice(0, 40),
++          extension: kind === 'peliculas' ? safeVodExtension(item.container_extension) : null,
++          posterUrl: safeImageUrl(item.stream_icon ?? item.cover, credentials.server),
++          year: yearOf(item.releaseDate, item.releasedate, item.year),
++          rating: shortText(item.rating_5based ?? item.rating, 12),
++          genre: shortText(item.genre, 160),
++        };
++        if (options.onItem) options.onItem(entry);
++        else items.push(entry);
++      },
++      { maxObjectBytes: 64 * 1024, ...(signal ? { signal } : {}) },
++    );
++    // A broken/nonconforming list must not look like a successfully empty catalog.
++    if (parsed.skipped || (parsed.objects > 0 && count === 0)) throw new Error('bad_response');
++  } catch (error) {
++    throw toIptvError(error, 'list');
++  }
++  return items;
++}
++
++export async function xtreamSeriesEpisodes(
++  net: NetClient,
++  credentials: XtreamCredentials,
++  seriesId: string,
++  policy: IptvFetchPolicy,
++  signal?: AbortSignal,
++): Promise<{ episodes: RawVodEpisode[]; metadata: RawVodMetadata }> {
++  try {
++    const response = await net.fetchJson(
++      xtreamApiUrl(credentials, 'get_series_info', { series_id: seriesId }),
++      {
++        maxBytes: 8 * 1024 * 1024,
++        totalTimeoutMs: 30_000,
++        idleTimeoutMs: 30_000,
++        headers: HEADERS,
++        iptv: policy,
++        ...(signal ? { signal } : {}),
++      },
++    );
++    const root =
++      response.body && typeof response.body === 'object'
++        ? (response.body as Record<string, unknown>)
++        : {};
++    if (!root.episodes || typeof root.episodes !== 'object') throw new Error('bad_response');
++    const metadata = metadataOf(root.info, credentials.server);
++    const bySeason = root.episodes as Record<string, unknown>;
++    const episodes: RawVodEpisode[] = [];
++    for (const [seasonKey, rawList] of Object.entries(bySeason)) {
++      if (!Array.isArray(rawList)) continue;
++      for (const raw of rawList) {
++        if (!raw || typeof raw !== 'object') continue;
++        const item = raw as Record<string, unknown>;
++        const sourceId = stringOf(item.id);
++        if (!/^[A-Za-z0-9_-]{1,40}$/.test(sourceId)) continue;
++        if (episodes.length >= MAX_EPISODES) throw new AppError('iptv_too_large');
++        episodes.push({
++          sourceId,
++          title: (stringOf(item.title) || `Episodio ${episodes.length + 1}`).slice(0, 240),
++          season: numberOf(item.season || seasonKey),
++          episode: numberOf(item.episode_num) || episodes.length + 1,
++          extension: safeVodExtension(item.container_extension),
++          posterUrl: safeImageUrl(
++            (item.info as Record<string, unknown> | undefined)?.movie_image ??
++              (item.info as Record<string, unknown> | undefined)?.cover ??
++              item.movie_image ??
++              item.cover,
++            credentials.server,
++          ),
++        });
++      }
++    }
++    return {
++      episodes: episodes.sort((a, b) => a.season - b.season || a.episode - b.episode),
++      metadata,
++    };
++  } catch (error) {
++    throw toIptvError(error, 'list');
++  }
++}
++
++export async function xtreamMovieInfo(
++  net: NetClient,
++  credentials: XtreamCredentials,
++  movieId: string,
++  policy: IptvFetchPolicy,
++  signal?: AbortSignal,
++): Promise<RawVodMetadata> {
++  try {
++    const response = await net.fetchJson(
++      xtreamApiUrl(credentials, 'get_vod_info', { vod_id: movieId }),
++      {
++        maxBytes: 2 * 1024 * 1024,
++        totalTimeoutMs: 20_000,
++        idleTimeoutMs: 15_000,
++        headers: HEADERS,
++        iptv: policy,
++        ...(signal ? { signal } : {}),
++      },
++    );
++    const root =
++      response.body && typeof response.body === 'object'
++        ? (response.body as Record<string, unknown>)
++        : {};
++    if (!root.info || typeof root.info !== 'object') throw new Error('bad_response');
++    return metadataOf(root.info, credentials.server);
++  } catch (error) {
++    throw toIptvError(error, 'list');
++  }
++}
++
++export function xtreamVodUrl(
++  credentials: XtreamCredentials,
++  kind: 'peliculas' | 'episode',
++  sourceId: string,
++  extension: string,
++): string {
++  const segment = (value: string) => encodeURIComponent(value);
++  const path = kind === 'peliculas' ? 'movie' : 'series';
++  return `${credentials.server}/${path}/${segment(credentials.username)}/${segment(credentials.password)}/${segment(sourceId)}.${safeVodExtension(extension)}`;
++}
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/vod-catalog.ts b/ace-player-neo/apps/server/src/modules/iptv/vod-catalog.ts
+new file mode 100644
+--- /dev/null
++++ b/ace-player-neo/apps/server/src/modules/iptv/vod-catalog.ts
+@@ -0,0 +1,324 @@
++import { errorMessage, type IptvVodItem, type IptvVodProgress } from '@ace/shared';
++import { AppError } from '../../core/errors.js';
++import type { IptvFetchPolicy, NetClient } from '../net/types.js';
++import { toIptvError } from './errors.js';
++import { vodLanguage, xtreamVodCategories, xtreamVodItems, type RawVodItem } from './vod.js';
++import type { XtreamCredentials } from './xtream.js';
++
++type Kind = RawVodItem['kind'];
++export interface VodRecord extends IptvVodItem {
++  readonly sourceId: string;
++}
++interface Part {
++  status: IptvVodProgress['status'];
++  categories: Map<string, string>;
++  categoriesReady: boolean;
++  completed: Set<string>;
++  attempted: Set<string>;
++  errors: Map<string, NonNullable<IptvVodProgress['error']>>;
++  wanted: Set<string>;
++  error: IptvVodProgress['error'];
++  at: number;
++  count: number;
++  retry: string | undefined;
++  controller: AbortController | null;
++}
++const emptyPart = (): Part => ({
++  status: 'idle',
++  categories: new Map(),
++  categoriesReady: false,
++  completed: new Set(),
++  attempted: new Set(),
++  errors: new Map(),
++  wanted: new Set(),
++  error: null,
++  at: 0,
++  count: 0,
++  retry: undefined,
++  controller: null,
++});
++export const emptyVodProgress = (): IptvVodProgress => ({
++  status: 'idle',
++  loadedCategories: 0,
++  totalCategories: 0,
++  error: null,
++});
++
++/**
++ * El listado Xtream se pide solo por categorías seleccionadas. La primera
++ * consulta lee dos listas pequeñas de categorías y nunca descarga el VOD entero.
++ */
++export class VodCatalog {
++  readonly byId = new Map<string, VodRecord>();
++  readonly episodes = new Map<string, { sourceId: string; extension: string }>();
++  private readonly imageUrls = new Map<string, string>();
++  private readonly parts: Record<Kind, Part> = { peliculas: emptyPart(), series: emptyPart() };
++  private disposed = false;
++
++  constructor(
++    readonly providerId: string,
++    readonly revision: number,
++    private readonly deps: {
++      net: NetClient;
++      credentials: XtreamCredentials;
++      policy: IptvFetchPolicy;
++      now: () => number;
++      id: (key: string) => string;
++      redact: (text: string) => string;
++    },
++  ) {}
++
++  dispose(): void {
++    this.disposed = true;
++    for (const part of Object.values(this.parts)) part.controller?.abort();
++    this.byId.clear();
++    this.episodes.clear();
++    this.imageUrls.clear();
++  }
++
++  ensure(
++    kind: 'todos' | Kind,
++    phase: 'categories' | 'items',
++    categories: readonly string[],
++    retry?: string,
++  ): void {
++    for (const selected of kind === 'todos' ? (['peliculas', 'series'] as const) : [kind]) {
++      const part = this.parts[selected];
++      if (this.disposed || part.controller) continue;
++      if (phase === 'categories' || categories.length === 0) {
++        this.startCategories(selected, part, retry);
++        continue;
++      }
++      const prefix = selected === 'peliculas' ? 'm:' : 's:';
++      const wanted = new Set(
++        categories
++          .filter((id) => id.startsWith(prefix))
++          .map((id) => id.slice(2))
++          .filter((id) => part.categories.has(id)),
++      );
++      part.wanted = wanted;
++      if (!part.categoriesReady) {
++        this.startCategories(selected, part, retry);
++        continue;
++      }
++      const retrying = retry !== undefined && retry !== part.retry;
++      if (retrying) {
++        part.retry = retry;
++        for (const id of wanted) {
++          part.attempted.delete(id);
++          part.completed.delete(id);
++          part.errors.delete(id);
++        }
++      }
++      this.startItems(selected, part, wanted);
++    }
++  }
++
++  progress(kind: Kind): IptvVodProgress {
++    const part = this.parts[kind];
++    let loadedCategories = 0;
++    for (const id of part.wanted) if (part.completed.has(id)) loadedCategories++;
++    const error = [...part.wanted].map((id) => part.errors.get(id)).find(Boolean) ?? part.error;
++    return {
++      status: part.status,
++      loadedCategories,
++      totalCategories: part.wanted.size,
++      error,
++    };
++  }
++
++  categories(kind: 'todos' | Kind): {
++    id: string;
++    name: string;
++    count: number;
++    loaded: boolean;
++    language: string | null;
++  }[] {
++    const result = new Map<
++      string,
++      { id: string; name: string; count: number; loaded: boolean; language: string | null }
++    >();
++    for (const selected of kind === 'todos' ? (['peliculas', 'series'] as const) : [kind]) {
++      const part = this.parts[selected];
++      for (const [key, name] of part.categories) {
++        const id = `${selected === 'peliculas' ? 'm' : 's'}:${key}`;
++        result.set(id, {
++          id,
++          name: this.deps.redact(name),
++          count: 0,
++          loaded: part.completed.has(key),
++          language: vodLanguage(name),
++        });
++      }
++    }
++    for (const item of this.byId.values()) {
++      if (kind !== 'todos' && kind !== item.kind) continue;
++      const entry = result.get(item.categoryId);
++      if (entry) entry.count++;
++      else if (item.category)
++        result.set(item.categoryId, {
++          id: item.categoryId,
++          name: item.category,
++          count: 1,
++          loaded: this.parts[item.kind].status === 'ready',
++          language: vodLanguage(item.category, item.language ?? ''),
++        });
++    }
++    return [...result.values()];
++  }
++
++  imageUrl(id: string): string | null {
++    return this.imageUrls.get(id.toLowerCase()) ?? null;
++  }
++
++  /** Registra una URL privada al servidor y devuelve solo su id firmado. */
++  registerImage(owner: string, url: string | null): string | null {
++    if (!url || this.disposed) return null;
++    const id = this.deps.id(`vod:image:${owner}:${url}`);
++    this.imageUrls.set(id, url);
++    return id;
++  }
++
++  private startCategories(kind: Kind, part: Part, retry?: string): void {
++    if (part.categoriesReady || this.disposed || part.controller) return;
++    const retrying = retry !== undefined && retry !== part.retry;
++    if (retrying) {
++      part.retry = retry;
++      part.error = null;
++    }
++    part.status = 'loading';
++    const controller = new AbortController();
++    part.controller = controller;
++    void (async () => {
++      try {
++        part.categories = await xtreamVodCategories(
++          this.deps.net,
++          this.deps.credentials,
++          kind === 'peliculas' ? 'get_vod_categories' : 'get_series_categories',
++          this.deps.policy,
++          controller.signal,
++        );
++        part.categoriesReady = true;
++        part.error = null;
++        part.status = 'idle';
++      } catch (error) {
++        if (!this.disposed) {
++          part.status = 'error';
++          part.error = this.failure(controller.signal.aborted ? controller.signal.reason : error);
++        }
++      } finally {
++        part.controller = null;
++      }
++    })();
++  }
++
++  private startItems(kind: Kind, part: Part, wanted: Set<string>): void {
++    if (this.disposed || part.controller) return;
++    if (!wanted.size) {
++      part.status = 'idle';
++      part.error = null;
++      return;
++    }
++    const pending = [...wanted].filter((id) => !part.attempted.has(id));
++    if (!pending.length) {
++      const failures = pending.length || [...wanted].some((id) => part.errors.has(id));
++      part.status = failures ? (part.count ? 'partial' : 'error') : 'ready';
++      part.error = [...wanted].map((id) => part.errors.get(id)).find(Boolean) ?? null;
++      return;
++    }
++    part.status = 'loading';
++    part.error = [...wanted].map((id) => part.errors.get(id)).find(Boolean) ?? null;
++    const controller = new AbortController();
++    part.controller = controller;
++    void this.loadItems(kind, part, pending, controller);
++  }
++
++  private put(raw: RawVodItem, part: Part): void {
++    if (this.disposed) return;
++    const id = this.deps.id(`vod:${raw.kind}:${raw.sourceId}`);
++    if (!this.byId.has(id) && part.count >= 100_000) throw new AppError('iptv_too_large');
++    const category = this.deps.redact(part.categories.get(raw.categoryId) ?? '');
++    const posterId = this.registerImage(id, raw.posterUrl);
++    if (!this.byId.has(id)) part.count++;
++    this.byId.set(id, {
++      id,
++      kind: raw.kind,
++      title: this.deps.redact(raw.title),
++      category,
++      categoryId: `${raw.kind === 'peliculas' ? 'm' : 's'}:${raw.categoryId}`,
++      language: vodLanguage(raw.language, category),
++      extension: raw.extension,
++      posterId,
++      year: raw.year,
++      rating: raw.rating,
++      genre: raw.genre,
++      sourceId: raw.sourceId,
++    });
++  }
++
++  private async loadItems(
++    kind: Kind,
++    part: Part,
++    categories: readonly string[],
++    controller: AbortController,
++  ): Promise<void> {
++    const timer = setTimeout(() => controller.abort(new AppError('iptv_timeout')), 8 * 60_000);
++    timer.unref();
++    let firstError: unknown = null;
++    try {
++      for (const categoryId of categories) {
++        if (controller.signal.aborted || this.disposed) break;
++        part.attempted.add(categoryId);
++        try {
++          await xtreamVodItems(
++            this.deps.net,
++            this.deps.credentials,
++            kind,
++            this.deps.policy,
++            controller.signal,
++            { categoryId, onItem: (item) => this.put(item, part) },
++          );
++          part.completed.add(categoryId);
++          part.errors.delete(categoryId);
++        } catch (error) {
++          if (controller.signal.aborted) throw controller.signal.reason;
++          const failure = toIptvError(error, 'list');
++          firstError ??= error;
++          part.errors.set(categoryId, this.failure(error));
++          if (failure.code === 'iptv_auth_failed' || failure.code === 'iptv_busy') break;
++          // Un límite en una categoría no debe impedir cargar las demás.
++        }
++      }
++      if (controller.signal.aborted) throw controller.signal.reason;
++      const failed = [...part.wanted].some((id) => part.errors.has(id));
++      part.status = failed ? (part.count ? 'partial' : 'error') : 'ready';
++      part.error = [...part.wanted].map((id) => part.errors.get(id)).find(Boolean) ?? null;
++      if (firstError && !part.error) part.error = this.failure(firstError);
++    } catch (error) {
++      if (!this.disposed) {
++        part.status = part.count ? 'partial' : 'error';
++        part.error = this.failure(controller.signal.aborted ? controller.signal.reason : error);
++      }
++    } finally {
++      clearTimeout(timer);
++      part.at = this.deps.now();
++      part.controller = null;
++    }
++  }
++
++  private failure(error: unknown): NonNullable<IptvVodProgress['error']> {
++    const safe = toIptvError(error, 'list');
++    return {
++      code: safe.code,
++      message:
++        safe.code === 'iptv_bad_list'
++          ? 'El proveedor devolvió una respuesta que no es un catálogo Xtream válido.'
++          : safe.code === 'iptv_busy'
++            ? 'El proveedor ha limitado las consultas. Espera un momento y vuelve a intentarlo.'
++            : safe.code === 'iptv_too_large'
++              ? 'Esta categoría supera el límite seguro de títulos. Elige otra categoría o idioma.'
++              : errorMessage(safe.code),
++      detail: safe.detail && /^[a-zA-Z0-9_:.-]{1,60}$/.test(safe.detail) ? safe.detail : null,
++    };
++  }
++}
+diff --git a/ace-player-neo/apps/web/src/api/client.ts b/ace-player-neo/apps/web/src/api/client.ts
+--- a/ace-player-neo/apps/web/src/api/client.ts
++++ b/ace-player-neo/apps/web/src/api/client.ts
+@@ -76,6 +76,10 @@
+   iptvChannels: IPTV_CLIENT.searchMs,
+   /* La pestaña IPTV de Canales (§16.2): el servidor responde en < 100 ms con 30 000 canales. */
+   iptvBrowse: IPTV_CLIENT.browseMs,
++  // Catalog pages read the current import snapshot; only episode details wait on Xtream.
++  iptvVodBrowse: 12_000,
++  iptvVodMovie: 25_000,
++  iptvVodSeries: 35_000,
+   engineRestart: 20_000,
+   healthLive: 4_000,
+ };
+diff --git a/ace-player-neo/apps/web/src/api/sse.ts b/ace-player-neo/apps/web/src/api/sse.ts
+--- a/ace-player-neo/apps/web/src/api/sse.ts
++++ b/ace-player-neo/apps/web/src/api/sse.ts
+@@ -163,6 +163,8 @@
+       void client.invalidateQueries({ queryKey: routePrefix('iptvChannels') });
+       // La pestaña IPTV de Canales: otro catálogo, otras categorías y otros recuentos (§16.6).
+       void client.invalidateQueries({ queryKey: routePrefix('iptvBrowse') });
++      void client.invalidateQueries({ queryKey: routePrefix('iptvVodBrowse') });
++      void client.invalidateQueries({ queryKey: routePrefix('iptvVodSeries') });
+       void client.invalidateQueries({ queryKey: routePrefix('libraryGet') });
+       // El bootstrap casi nunca tiene una vista suscrita (se siembra al
+       // arrancar): 'all' lo vuelve a pedir igual, porque iptvActive() lo lee.
+diff --git a/ace-player-neo/deploy/umbrel/nginx.conf b/ace-player-neo/deploy/umbrel/nginx.conf
+--- a/ace-player-neo/deploy/umbrel/nginx.conf
++++ b/ace-player-neo/deploy/umbrel/nginx.conf
+@@ -1,7 +1,7 @@
+ # nginx de Ace Player Neo 0.7.0. Compose la copia a conf.d/default.conf, que el
+ # nginx.conf de la imagen incluye dentro de http{}: por eso aqui caben map y
+-# log_format. Los nombres de contenedor son los de produccion
+-# (ismaeloul-ace-player-neo_<servicio>_1) y tienen que coincidir con Compose.
++# log_format. Los nombres de contenedor son los de la tienda de pruebas
++# (codex-prueba-ace-stream-neo_<servicio>_1) y tienen que coincidir con Compose.
+ 
+ # Origen de la peticion, calculado sobre la URI CRUDA y nunca por location. La
+ # pasarela de umbreld deja pasar sin login lo que casa con /native/* mirando la
+@@ -86,7 +86,7 @@
+ 
+   location /native/ {
+     gzip off;
+-    proxy_pass http://ismaeloul-ace-player-neo_storage_1:3000/;
++    proxy_pass http://codex-prueba-ace-stream-neo_storage_1:3000/;
+     proxy_http_version 1.1;
+     proxy_set_header Host $http_host;
+     proxy_set_header Connection "";
+@@ -109,7 +109,7 @@
+       return 403;
+     }
+     gzip off;
+-    proxy_pass http://ismaeloul-ace-player-neo_storage_1:3000/api/v1/events;
++    proxy_pass http://codex-prueba-ace-stream-neo_storage_1:3000/api/v1/events;
+     proxy_http_version 1.1;
+     proxy_set_header Host $http_host;
+     proxy_set_header Connection "";
+@@ -125,13 +125,31 @@
+     if ($ace_origin = native) {
+       return 403;
+     }
+-    proxy_pass http://ismaeloul-ace-player-neo_storage_1:3000/api/;
++    proxy_pass http://codex-prueba-ace-stream-neo_storage_1:3000/api/;
+     # El backend compara Origin con Host para bloquear mutaciones de otro origen.
+     proxy_set_header Host $http_host;
+     proxy_set_header X-Ace-Origin $ace_origin;
+     proxy_set_header X-Request-Id $request_id;
+     # /api/remux puede tardar hasta 45 s en responder (espera el manifiesto)
+     proxy_read_timeout 60s;
++  }
++
++  # Peliculas y episodios: transmitir sin acumular el archivo en el proxy.
++  location /api/v1/iptv/vod/video/ {
++    if ($ace_origin = native) {
++      return 403;
++    }
++    access_log off;
++    gzip off;
++    proxy_pass http://codex-prueba-ace-stream-neo_storage_1:3000/api/v1/iptv/vod/video/;
++    proxy_http_version 1.1;
++    proxy_set_header Host $http_host;
++    proxy_set_header Connection "";
++    proxy_set_header X-Ace-Origin $ace_origin;
++    proxy_set_header X-Request-Id $request_id;
++    proxy_buffering off;
++    proxy_request_buffering off;
++    proxy_read_timeout 120s;
+   }
+ 
+   # Video IPTV de la web por hls.js (docs/iptv.md 6.6): los segmentos del remux
+@@ -143,7 +161,7 @@
+     }
+     access_log off;
+     gzip off;
+-    proxy_pass http://ismaeloul-ace-player-neo_storage_1:3000/api/v1/video/;
++    proxy_pass http://codex-prueba-ace-stream-neo_storage_1:3000/api/v1/video/;
+     proxy_http_version 1.1;
+     proxy_set_header Host $http_host;
+     proxy_set_header Connection "";
+@@ -161,7 +179,7 @@
+     # Cada segmento HLS del iPhone es una linea de log: fuera del registro.
+     access_log off;
+     gzip off;
+-    proxy_pass http://ismaeloul-ace-player-neo_storage_1:3000/remux/;
++    proxy_pass http://codex-prueba-ace-stream-neo_storage_1:3000/remux/;
+     proxy_http_version 1.1;
+     proxy_set_header Host $http_host;
+     proxy_set_header Connection "";
+@@ -181,7 +199,7 @@
+       return 403;
+     }
+     gzip off;
+-    proxy_pass http://ismaeloul-ace-player-neo_acestream_1:6878/ace/;
++    proxy_pass http://codex-prueba-ace-stream-neo_acestream_1:6878/ace/;
+     proxy_http_version 1.1;
+     proxy_set_header Host $http_host;
+     proxy_set_header Connection "";
+@@ -197,12 +215,12 @@
+     sub_filter_once off;
+     sub_filter http://127.0.0.1:6878/ace/ /ace/;
+     sub_filter http://localhost:6878/ace/ /ace/;
+-    sub_filter http://ismaeloul-ace-player-neo_acestream_1:6878/ace/ /ace/;
++    sub_filter http://codex-prueba-ace-stream-neo_acestream_1:6878/ace/ /ace/;
+     sub_filter http://acestream:6878/ace/ /ace/;
+     sub_filter http://127.0.0.1:6878/content/ /content/;
+     sub_filter http://localhost:6878/content/ /content/;
+     sub_filter http://acestream:6878/content/ /content/;
+-    sub_filter http://ismaeloul-ace-player-neo_acestream_1:6878/content/ /content/;
++    sub_filter http://codex-prueba-ace-stream-neo_acestream_1:6878/content/ /content/;
+   }
+ 
+   location /content/ {
+@@ -210,7 +228,7 @@
+       return 403;
+     }
+     gzip off;
+-    proxy_pass http://ismaeloul-ace-player-neo_acestream_1:6878/content/;
++    proxy_pass http://codex-prueba-ace-stream-neo_acestream_1:6878/content/;
+     proxy_http_version 1.1;
+     proxy_set_header Host $http_host;
+     proxy_set_header Connection "";
+diff --git a/ace-player-neo/apps/web/tsconfig.json b/ace-player-neo/apps/web/tsconfig.json
+--- a/ace-player-neo/apps/web/tsconfig.json
++++ b/ace-player-neo/apps/web/tsconfig.json
+@@ -12,6 +12,7 @@
+     "allowImportingTsExtensions": true,
+     "types": ["vite/client", "@testing-library/jest-dom/vitest"],
+     "paths": {
++      "@ace/shared": ["../../packages/shared/src/index.ts"],
+       "@fixtures/*": ["../../packages/shared/fixtures/*"]
+     }
+   },
+diff --git a/ace-player-neo/apps/web/vite.config.ts b/ace-player-neo/apps/web/vite.config.ts
+--- a/ace-player-neo/apps/web/vite.config.ts
++++ b/ace-player-neo/apps/web/vite.config.ts
+@@ -55,6 +55,7 @@
+   ],
+   resolve: {
+     alias: {
++      '@ace/shared': path.join(SHARED_DIR, 'src', 'index.ts'),
+       // Ejemplos de cada respuesta de la API: los usa el modo demo y los tests.
+       '@fixtures': path.join(SHARED_DIR, 'fixtures'),
+     },
+diff --git a/ace-player-neo/apps/web/src/app/Nav.tsx b/ace-player-neo/apps/web/src/app/Nav.tsx
+--- a/ace-player-neo/apps/web/src/app/Nav.tsx
++++ b/ace-player-neo/apps/web/src/app/Nav.tsx
+@@ -91,7 +91,7 @@
+           {...link(vista)}
+         >
+           <Icon name={NAV_ICON[vista]} size={24} />
+-          <span>{vista === 'pelis-series' ? 'Pelis' : VISTA_TITLE[vista]}</span>
++          <span>{VISTA_TITLE[vista]}</span>
+         </a>
+       ))}
+     </nav>
+@@ -148,7 +148,7 @@
+               {...link(vista)}
+             >
+               <Icon name={NAV_ICON[vista]} size={20} />
+-              <span>{vista === 'pelis-series' ? 'Pelis' : VISTA_TITLE[vista]}</span>
++              <span>{VISTA_TITLE[vista]}</span>
+             </a>
+           ))}
+         </div>
+diff --git a/ace-player-neo/apps/web/src/app/shell.css b/ace-player-neo/apps/web/src/app/shell.css
+--- a/ace-player-neo/apps/web/src/app/shell.css
++++ b/ace-player-neo/apps/web/src/app/shell.css
+@@ -272,6 +272,12 @@
+ .tabbar__item[aria-current='page'] {
+   color: var(--accent-ink);
+ }
++.tabbar__item span {
++  max-width: 100%;
++  text-align: center;
++  line-height: 1.1;
++  text-wrap: balance;
++}
+ .tabbar__item:focus-visible {
+   outline-offset: -2px;
+ }
+diff --git a/ace-player-neo/apps/web/src/features/pelis-series/index.tsx b/ace-player-neo/apps/web/src/features/pelis-series/index.tsx
+--- a/ace-player-neo/apps/web/src/features/pelis-series/index.tsx
++++ b/ace-player-neo/apps/web/src/features/pelis-series/index.tsx
+@@ -1,5 +1,5 @@
+ import type { Item } from '@ace/shared';
+-import { useMemo } from 'react';
++import { useMemo, useState } from 'react';
+ import { useApiQuery } from '../../api/index.ts';
+ import type { ViewProps } from '../../app/contracts.ts';
+ import { useNavigate, useSearchParam } from '../../app/router.tsx';
+@@ -7,6 +7,7 @@
+ import { Button, Card, EmptyState, Icon, Segmented, SkeletonRows, TextField } from '../../ui/index.ts';
+ import { playChannel } from '../library/play.ts';
+ import { classifyVod, languagesFor, matchesVodSearch, vodLanguages, type VodKind } from './model.ts';
++import { XtreamVodView } from './XtreamVodView.tsx';
+ import './pelis-series.css';
+ 
+ type KindFilter = 'todos' | VodKind;
+@@ -22,7 +23,9 @@
+ 
+ export default function PelisSeriesView({ active }: ViewProps) {
+   const navigate = useNavigate();
++  const [showAce, setShowAce] = useState(false);
+   const library = useApiQuery('libraryGet', undefined, { enabled: active });
++  const iptv = useApiQuery('iptvGet', undefined, { enabled: active });
+   const [query, setQuery] = useSearchParam('psq');
+   const [kindParam, setKindParam] = useSearchParam('pskind');
+   const [languageParam, setLanguageParam] = useSearchParam('pslang');
+@@ -69,6 +72,11 @@
+       ? `${source.name} · ${plural(vodItems.length)}`
+       : 'Películas y series de la lista IPTV activa';
+ 
++  const xtreamActive = iptv.data?.provider?.kind === 'xtream' && iptv.data.provider.enabled;
++  if (xtreamActive && !showAce) {
++    return <XtreamVodView active={active} onShowAce={() => setShowAce(true)} />;
++  }
++
+   if (library.isLoading) {
+     return (
+       <section className="vod">
+@@ -100,6 +108,8 @@
+   return (
+     <section className="vod">
+       <ViewHeader title="Pelis y Series" subtitle={subtitle} />
++
++      {xtreamActive ? <Button icon="cine" onClick={() => setShowAce(false)}>Ver catálogo IPTV</Button> : null}
+ 
+       <div className="vod__toolbar">
+         <Segmented<KindFilter>
+diff --git a/ace-player-neo/apps/web/src/features/pelis-series/XtreamVodView.tsx b/ace-player-neo/apps/web/src/features/pelis-series/XtreamVodView.tsx
+new file mode 100644
+--- /dev/null
++++ b/ace-player-neo/apps/web/src/features/pelis-series/XtreamVodView.tsx
+@@ -0,0 +1,869 @@
++import { useState } from 'react';
++import type { IptvVodItem } from '@ace/shared';
++import { useApiQuery } from '../../api/index.ts';
++import { describeFailure, isApiError } from '../../api/errors.ts';
++import { routeUrl } from '../../api/routes.ts';
++import { useSearchParam } from '../../app/router.tsx';
++import { ViewHeader } from '../../app/ViewHeader.tsx';
++import {
++  Button,
++  Card,
++  EmptyState,
++  Icon,
++  Segmented,
++  SkeletonRows,
++  TextField,
++} from '../../ui/index.ts';
++
++type Kind = 'todos' | 'peliculas' | 'series';
++type Playing = { id: string; title: string; extension: string | null };
++type Language = { id: string; label: string };
++type LanguagePreferences = {
++  applied: boolean;
++  languages: string[];
++  categories: string[];
++  assignments: Record<string, string>;
++};
++
++const PREFS_KEY = 'ace-stream-neo.vod-language-prefs.v1';
++const LANGUAGES: readonly Language[] = [
++  { id: 'es-ES', label: 'Español (España)' },
++  { id: 'es-419', label: 'Español latinoamericano' },
++  { id: 'en', label: 'Inglés' },
++  { id: 'fr', label: 'Francés' },
++  { id: 'de', label: 'Alemán' },
++  { id: 'it', label: 'Italiano' },
++  { id: 'pt-PT', label: 'Portugués (Portugal)' },
++  { id: 'pt-BR', label: 'Portugués (Brasil)' },
++  { id: 'ca', label: 'Catalán' },
++  { id: 'ar', label: 'Árabe' },
++  { id: 'ja', label: 'Japonés' },
++];
++const LANGUAGE_NAMES = new Map(LANGUAGES.map(({ id, label }) => [id, label]));
++const blankPreferences = (): LanguagePreferences => ({
++  applied: false,
++  languages: [],
++  categories: [],
++  assignments: {},
++});
++
++function readPreferences(): LanguagePreferences {
++  if (typeof window === 'undefined') return blankPreferences();
++  try {
++    const raw: unknown = JSON.parse(window.localStorage.getItem(PREFS_KEY) ?? 'null');
++    if (!raw || typeof raw !== 'object') return blankPreferences();
++    const item = raw as Record<string, unknown>;
++    const assignments =
++      item.assignments && typeof item.assignments === 'object'
++        ? Object.fromEntries(
++            Object.entries(item.assignments as Record<string, unknown>).filter(
++              ([key, value]) =>
++                /^[ms]:[A-Za-z0-9_-]{1,80}$/.test(key) &&
++                typeof value === 'string' &&
++                LANGUAGES.some((language) => language.id === value),
++            ),
++          )
++        : {};
++    return {
++      applied: item.applied === true,
++      languages: Array.isArray(item.languages)
++        ? item.languages.filter(
++            (value): value is string =>
++              typeof value === 'string' && LANGUAGES.some((language) => language.id === value),
++          )
++        : [],
++      categories: Array.isArray(item.categories)
++        ? item.categories.filter(
++            (value): value is string =>
++              typeof value === 'string' && /^[ms]:[A-Za-z0-9_-]{1,80}$/.test(value),
++          )
++        : [],
++      assignments: assignments as Record<string, string>,
++    };
++  } catch {
++    return blankPreferences();
++  }
++}
++
++function savePreferences(preferences: LanguagePreferences): void {
++  try {
++    window.localStorage.setItem(PREFS_KEY, JSON.stringify(preferences));
++  } catch {
++    // La selección sigue activa en esta sesión aunque el navegador no permita persistirla.
++  }
++}
++
++function languageName(value: string | null): string {
++  return value ? (LANGUAGE_NAMES.get(value) ?? value) : 'Sin especificar';
++}
++
++const plural = (count: number) => `${count} ${count === 1 ? 'título' : 'títulos'}`;
++const episodeFailure = (error: unknown) =>
++  isApiError(error) && error.code === 'iptv_bad_list'
++    ? 'El proveedor no devolvió una lista de episodios válida.'
++    : describeFailure(error);
++
++function VodArtwork({
++  kind,
++  title,
++  posterId,
++  className = '',
++}: {
++  kind: 'peliculas' | 'series';
++  title: string;
++  posterId: string | null;
++  className?: string;
++}) {
++  const [failedId, setFailedId] = useState<string | null>(null);
++  const [loadedId, setLoadedId] = useState<string | null>(null);
++  const broken = Boolean(posterId && failedId === posterId);
++  const loaded = Boolean(posterId && loadedId === posterId);
++  return (
++    <div
++      className={`vod-card__art ${kind === 'series' ? 'vod-card__art--series' : ''} ${loaded ? 'vod-card__art--loaded' : ''} ${className}`}
++      aria-label={posterId && !broken ? `Carátula de ${title}` : `Imagen genérica de ${title}`}
++    >
++      <span className="vod-card__type">{kind === 'series' ? 'SERIE' : 'PELÍCULA'}</span>
++      <Icon name="cine" size={32} />
++      <span className="vod-card__initial">{title.slice(0, 1).toLocaleUpperCase('es')}</span>
++      {posterId && !broken ? (
++        <img
++          className="vod-card__poster"
++          src={routeUrl('iptvImage', { id: posterId })}
++          alt=""
++          loading="lazy"
++          onLoad={() => setLoadedId(posterId)}
++          onError={() => setFailedId(posterId)}
++        />
++      ) : null}
++    </div>
++  );
++}
++
++function VodBackdrop({ id }: { id: string | null }) {
++  const [failedId, setFailedId] = useState<string | null>(null);
++  if (!id || failedId === id) return null;
++  return (
++    <img
++      className="vod__backdrop"
++      src={routeUrl('iptvImage', { id })}
++      alt=""
++      loading="lazy"
++      onError={() => setFailedId(id)}
++    />
++  );
++}
++
++export function XtreamVodView({ active, onShowAce }: { active: boolean; onShowAce: () => void }) {
++  const [query, setQuery] = useSearchParam('psq');
++  const [kindParam, setKindParam] = useSearchParam('pskind');
++  const [language, setLanguage] = useSearchParam('pslang');
++  const [category, setCategory] = useSearchParam('pscat');
++  const [offset, setOffset] = useState(0);
++  const [seriesId, setSeriesId] = useState<string | null>(null);
++  const [movieId, setMovieId] = useState<string | null>(null);
++  const [playing, setPlaying] = useState<Playing | null>(null);
++  const [playError, setPlayError] = useState(false);
++  const [retry, setRetry] = useState<string>();
++  const [preferences, setPreferences] = useState<LanguagePreferences>(readPreferences);
++  const [languageDraft, setLanguageDraft] = useState<string[]>(preferences.languages);
++  const [settingsOpen, setSettingsOpen] = useState(!preferences.applied);
++  const [setupError, setSetupError] = useState<string | null>(null);
++  const kind: Kind = kindParam === 'peliculas' || kindParam === 'series' ? kindParam : 'todos';
++  const categoriesOnly = !preferences.applied || settingsOpen;
++  const selectedCategories = preferences.categories;
++  const requestedCategories = language
++    ? selectedCategories.filter((id) => preferences.assignments[id] === language)
++    : selectedCategories;
++  const vod = useApiQuery(
++    'iptvVodBrowse',
++    {
++      query: {
++        phase: categoriesOnly ? 'categories' : 'items',
++        kind: categoriesOnly ? 'todos' : kind,
++        q: query ?? '',
++        offset,
++        limit: 60,
++        categories: categoriesOnly ? [] : requestedCategories,
++        ...(category ? { category } : {}),
++        ...(retry ? { retry } : {}),
++      },
++    },
++    {
++      enabled: active && !playing && !seriesId && !movieId,
++      staleTime: 10_000,
++      refetchOnMount: 'always',
++      refetchOnWindowFocus: true,
++      refetchInterval: (result) =>
++        result.state.status !== 'error' && result.state.data?.loading ? 1_500 : false,
++    },
++  );
++  const detail = useApiQuery(
++    'iptvVodSeries',
++    { params: { id: seriesId ?? '0'.repeat(40) } },
++    { enabled: active && Boolean(seriesId) && !playing },
++  );
++  const movieDetail = useApiQuery(
++    'iptvVodMovie',
++    { params: { id: movieId ?? '0'.repeat(40) } },
++    { enabled: active && Boolean(movieId) && !playing },
++  );
++  const data = vod.data;
++  const parts = (['peliculas', 'series'] as const)
++    .filter((part) => kind === 'todos' || part === kind)
++    .map((part) => ({
++      kind: part,
++      label: part === 'peliculas' ? 'Películas' : 'Series',
++      progress: data?.progress[part],
++    }));
++  const incomplete = parts.some(
++    (part) => part.progress?.status === 'partial' || part.progress?.status === 'error',
++  );
++  const reload = () => {
++    setOffset(0);
++    setRetry(String(Date.now()));
++  };
++  const resetPage = () => {
++    setOffset(0);
++    setSeriesId(null);
++    setMovieId(null);
++  };
++  const selectKind = (next: Kind) => {
++    setKindParam(next === 'todos' ? null : next);
++    setCategory(null);
++    resetPage();
++  };
++  const selectCategory = (next: string) => {
++    setCategory(next || null);
++    resetPage();
++  };
++  const selectLanguage = (next: string) => {
++    setLanguage(next || null);
++    resetPage();
++  };
++  const openVideo = (video: Playing) => {
++    setPlayError(false);
++    setPlaying(video);
++  };
++  const beginLanguageEdit = () => {
++    setLanguageDraft(preferences.languages);
++    setSetupError(null);
++    setSettingsOpen(true);
++  };
++  const saveLanguageSelection = () => {
++    const assignments = { ...preferences.assignments };
++    for (const item of data?.categories ?? [])
++      if (!assignments[item.id] && item.language) assignments[item.id] = item.language;
++    const chosen = (data?.categories ?? []).filter((item) =>
++      languageDraft.includes(assignments[item.id] ?? item.language ?? ''),
++    );
++    const next: LanguagePreferences = {
++      applied: true,
++      languages: [...languageDraft],
++      categories: chosen.map((item) => item.id),
++      assignments,
++    };
++    if (!next.languages.length || !next.categories.length) {
++      setSetupError('Selecciona al menos un idioma y asigna una categoría a ese idioma.');
++      return;
++    }
++    if (next.categories.length > 300) {
++      setSetupError(
++        'Has seleccionado más de 300 categorías. Elige menos idiomas o deja sin asignar las categorías que no quieras cargar.',
++      );
++      return;
++    }
++    setPreferences(next);
++    savePreferences(next);
++    setSettingsOpen(false);
++    setSetupError(null);
++    setLanguage(null);
++    setCategory(null);
++    setRetry(undefined);
++    setOffset(0);
++  };
++
++  if (playing)
++    return (
++      <section className="vod">
++        <ViewHeader title={playing.title} subtitle="Reproduciendo desde tu IPTV" />
++        <Button
++          icon="chev-l"
++          onClick={() => {
++            setPlaying(null);
++            setPlayError(false);
++          }}
++        >
++          Volver a Pelis y Series
++        </Button>
++        <video
++          key={playing.id}
++          className="vod__video"
++          controls
++          playsInline
++          preload="metadata"
++          src={routeUrl('iptvVodVideo', { id: playing.id })}
++          onError={() => setPlayError(true)}
++        >
++          Tu navegador no puede reproducir este vídeo.
++        </video>
++        {playError ? (
++          <p role="alert" className="vod__play-error">
++            No se pudo reproducir este archivo. El proveedor puede haberlo retirado o el formato
++            puede no ser compatible con este navegador.
++          </p>
++        ) : null}
++      </section>
++    );
++
++  if (seriesId)
++    return (
++      <section className="vod">
++        <ViewHeader
++          title={detail.data?.title ?? 'Serie'}
++          subtitle="Temporadas y episodios de tu IPTV"
++        />
++        <Button icon="chev-l" onClick={() => setSeriesId(null)}>
++          Volver al catálogo
++        </Button>
++        {detail.data ? (
++          <Card className="vod__details">
++            <VodBackdrop id={detail.data.backdropId} />
++            <VodArtwork
++              kind="series"
++              title={detail.data.title}
++              posterId={detail.data.posterId}
++              className="vod__detail-poster"
++            />
++            <div className="vod__detail-copy">
++              <MetadataLine
++                year={detail.data.year}
++                rating={detail.data.rating}
++                genre={detail.data.genre}
++              />
++              {detail.data.plot ? <p>{detail.data.plot}</p> : null}
++              {detail.data.director ? (
++                <p>
++                  <strong>Dirección:</strong> {detail.data.director}
++                </p>
++              ) : null}
++              {detail.data.cast ? (
++                <p>
++                  <strong>Reparto:</strong> {detail.data.cast}
++                </p>
++              ) : null}
++            </div>
++          </Card>
++        ) : null}
++        {detail.isLoading ? <SkeletonRows rows={5} label="Cargando episodios y ficha…" /> : null}
++        {detail.isError ? (
++          <EmptyState
++            title="No se pudieron cargar los episodios"
++            tone="error"
++            actions={
++              <Button icon="refresh" onClick={() => void detail.refetch()}>
++                Reintentar
++              </Button>
++            }
++          >
++            {episodeFailure(detail.error)}
++          </EmptyState>
++        ) : null}
++        {detail.data && detail.data.episodes.length === 0 ? (
++          <EmptyState title="Esta serie no tiene episodios publicados" actions={null}>
++            El proveedor aún no ofrece episodios para esta serie.
++          </EmptyState>
++        ) : null}
++        {detail.data?.episodes.map((episode) => (
++          <Card as="article" key={episode.id} className="vod__episode">
++            <VodArtwork
++              kind="series"
++              title={episode.title}
++              posterId={episode.posterId}
++              className="vod__episode-poster"
++            />
++            <div className="vod__episode-title">
++              <strong>
++                Temporada {episode.season} · Episodio {episode.episode}
++              </strong>
++              <p>{episode.title}</p>
++            </div>
++            <Button
++              icon="play"
++              onClick={() =>
++                openVideo({ id: episode.id, title: episode.title, extension: episode.extension })
++              }
++            >
++              Reproducir
++            </Button>
++          </Card>
++        ))}
++      </section>
++    );
++
++  if (movieId) {
++    const item = data?.items.find((entry) => entry.id === movieId);
++    const metadata = movieDetail.data;
++    return (
++      <section className="vod">
++        <ViewHeader title={item?.title ?? 'Película'} subtitle="Ficha de tu catálogo IPTV" />
++        <Button icon="chev-l" onClick={() => setMovieId(null)}>
++          Volver al catálogo
++        </Button>
++        {movieDetail.isLoading ? <SkeletonRows rows={4} label="Cargando metadatos…" /> : null}
++        {movieDetail.isError ? (
++          <p className="vod__metadata-note">
++            El proveedor no ha facilitado la ficha completa. Se muestran los datos disponibles en el
++            catálogo.
++          </p>
++        ) : null}
++        {item ? (
++          <Card className="vod__details">
++            <VodBackdrop id={metadata?.backdropId ?? null} />
++            <VodArtwork
++              kind="peliculas"
++              title={item.title}
++              posterId={metadata?.posterId ?? item.posterId}
++              className="vod__detail-poster"
++            />
++            <div className="vod__detail-copy">
++              <h2>{item.title}</h2>
++              <MetadataLine
++                year={metadata?.year ?? item.year}
++                rating={metadata?.rating ?? item.rating}
++                genre={metadata?.genre ?? item.genre}
++              />
++              {metadata?.plot ? <p>{metadata.plot}</p> : null}
++              {metadata?.director ? (
++                <p>
++                  <strong>Dirección:</strong> {metadata.director}
++                </p>
++              ) : null}
++              {metadata?.cast ? (
++                <p>
++                  <strong>Reparto:</strong> {metadata.cast}
++                </p>
++              ) : null}
++              <Button
++                variant="primary"
++                icon="play"
++                onClick={() =>
++                  openVideo({ id: item.id, title: item.title, extension: item.extension })
++                }
++              >
++                Reproducir película
++              </Button>
++            </div>
++          </Card>
++        ) : null}
++      </section>
++    );
++  }
++
++  const categoryCatalogReady = Boolean(
++    data &&
++    !data.progress.peliculas.status.includes('loading') &&
++    !data.progress.series.status.includes('loading'),
++  );
++  if (categoriesOnly) {
++    const categories = data?.categories ?? [];
++    return (
++      <section className="vod">
++        <ViewHeader title="Pelis y Series" subtitle="Prepara el catálogo de tu IPTV" />
++        <div className="vod__actions">
++          <Button icon="cine" onClick={onShowAce}>
++            Ver entradas AceStream
++          </Button>
++        </div>
++        {vod.isLoading || !data ? (
++          <SkeletonRows rows={5} label="Leyendo categorías de la IPTV…" />
++        ) : null}
++        {vod.isError ? (
++          <EmptyState
++            title="No se pudieron leer las categorías"
++            tone="error"
++            actions={
++              <Button icon="refresh" onClick={() => void vod.refetch()}>
++                Reintentar
++              </Button>
++            }
++          >
++            {describeFailure(vod.error)}
++          </EmptyState>
++        ) : null}
++        {data?.loading ? (
++          <p className="vod__sync" role="status">
++            Cargando solo la lista de categorías; aún no se descargan películas ni series.
++          </p>
++        ) : null}
++        {data && !data.active ? (
++          <EmptyState title="Activa tu cuenta Xtream" actions={null}>
++            Configura la cuenta en Ajustes → IPTV para consultar sus películas y series.
++          </EmptyState>
++        ) : null}
++        {data?.active && categoryCatalogReady ? (
++          <Card className="vod__setup">
++            <div>
++              <p className="vod__eyebrow">PRIMER PASO</p>
++              <h2>¿Qué idiomas quieres ver?</h2>
++              <p>
++                Elegiremos las categorías de esos idiomas y cargaremos solo sus títulos. La
++                selección se puede cambiar después.
++              </p>
++              <p className="vod__metadata-note">
++                El idioma se deduce de las categorías del proveedor; no certifica las pistas de
++                audio del archivo.
++              </p>
++            </div>
++            <div className="vod__language-options" aria-label="Idiomas incluidos">
++              {LANGUAGES.map((item) => (
++                <label key={item.id} className="vod__language-choice">
++                  <input
++                    type="checkbox"
++                    checked={languageDraft.includes(item.id)}
++                    onChange={(event) => {
++                      setSetupError(null);
++                      setLanguageDraft((previous) =>
++                        event.currentTarget.checked
++                          ? [...new Set([...previous, item.id])]
++                          : previous.filter((id) => id !== item.id),
++                      );
++                    }}
++                  />
++                  <span>{item.label}</span>
++                </label>
++              ))}
++            </div>
++            {categories.length ? (
++              <details className="vod__category-language">
++                <summary>Revisar el idioma de las categorías ({categories.length})</summary>
++                <p>
++                  Si una carpeta no se detectó bien, puedes asignarle el idioma que corresponda.
++                  Español genérico se interpreta como Español (España).
++                </p>
++                <div className="vod__category-language-list">
++                  {categories.map((item) => {
++                    const selected = preferences.assignments[item.id] ?? item.language ?? '';
++                    return (
++                      <label key={item.id}>
++                        <span>
++                          {item.name}{' '}
++                          <small>{item.id.startsWith('m:') ? 'Películas' : 'Series'}</small>
++                        </span>
++                        <select
++                          value={selected}
++                          onChange={(event) => {
++                            const assignments = { ...preferences.assignments };
++                            if (event.currentTarget.value)
++                              assignments[item.id] = event.currentTarget.value;
++                            else delete assignments[item.id];
++                            setPreferences((previous) => ({ ...previous, assignments }));
++                          }}
++                        >
++                          <option value="">Sin asignar</option>
++                          {LANGUAGES.map((option) => (
++                            <option key={option.id} value={option.id}>
++                              {option.label}
++                            </option>
++                          ))}
++                        </select>
++                      </label>
++                    );
++                  })}
++                </div>
++              </details>
++            ) : data.progress.peliculas.error || data.progress.series.error ? (
++              <p role="alert" className="vod__metadata-note">
++                No se pudieron obtener las categorías del proveedor. Revisa la cuenta Xtream en
++                Ajustes → IPTV y vuelve a intentarlo.
++              </p>
++            ) : (
++              <p className="vod__metadata-note">
++                El proveedor no ha publicado categorías de películas o series; no se descargará la
++                lista completa para evitar volver a superar el límite.
++              </p>
++            )}
++            {data.progress.peliculas.error || data.progress.series.error ? (
++              <Button icon="refresh" disabled={data.loading || vod.isFetching} onClick={reload}>
++                Reintentar lectura de categorías
++              </Button>
++            ) : null}
++            {setupError ? (
++              <p role="alert" className="vod__play-error">
++                {setupError}
++              </p>
++            ) : null}
++            <div className="vod__actions">
++              <Button variant="primary" icon="buscar" onClick={saveLanguageSelection}>
++                Aplicar idiomas y abrir catálogo
++              </Button>
++              {preferences.applied ? (
++                <Button
++                  onClick={() => {
++                    setPreferences(readPreferences());
++                    setLanguageDraft(readPreferences().languages);
++                    setSettingsOpen(false);
++                  }}
++                >
++                  Cancelar
++                </Button>
++              ) : null}
++            </div>
++          </Card>
++        ) : null}
++      </section>
++    );
++  }
++
++  return (
++    <section className="vod">
++      <ViewHeader
++        title="Pelis y Series"
++        subtitle={
++          data?.active
++            ? `${data.provider} · ${plural(data.movies + data.series)} cargados`
++            : 'Catálogo de películas y series de tu IPTV'
++        }
++      />
++      <div className="vod__actions">
++        <Button icon="cine" onClick={onShowAce}>
++          Ver entradas AceStream
++        </Button>
++        <Button icon="learn" onClick={beginLanguageEdit}>
++          Cambiar idiomas
++        </Button>
++        <Button icon="refresh" disabled={data?.loading || vod.isFetching} onClick={reload}>
++          Actualizar catálogo
++        </Button>
++      </div>
++      <div className="vod__toolbar">
++        <Segmented<Kind>
++          label="Filtrar por tipo"
++          block
++          value={kind}
++          onChange={selectKind}
++          items={[
++            { value: 'todos', label: 'Todo', count: data ? data.movies + data.series : undefined },
++            { value: 'peliculas', label: 'Películas', count: data?.movies },
++            { value: 'series', label: 'Series', count: data?.series },
++          ]}
++        />
++        <div className="vod__filters">
++          <TextField
++            aria-label="Buscar películas y series"
++            label="Buscar películas y series"
++            hideLabel
++            variant="search"
++            type="search"
++            icon="buscar"
++            placeholder="Buscar por título, categoría o idioma"
++            value={query ?? ''}
++            onChange={(event) => {
++              setQuery(event.currentTarget.value || null);
++              resetPage();
++            }}
++            autoComplete="off"
++            spellCheck={false}
++          />
++          <label className="vod__language">
++            <span>Idioma</span>
++            <select
++              value={language ?? ''}
++              onChange={(event) => selectLanguage(event.currentTarget.value)}
++            >
++              <option value="">Todos los idiomas elegidos</option>
++              {preferences.languages.map((item) => (
++                <option key={item} value={item}>
++                  {languageName(item)}
++                </option>
++              ))}
++            </select>
++            <Icon name="chev-d" size={18} />
++          </label>
++          <label className="vod__language">
++            <span>Categoría</span>
++            <select
++              value={category ?? ''}
++              onChange={(event) => selectCategory(event.currentTarget.value)}
++            >
++              <option value="">Todas las categorías elegidas</option>
++              {data?.categories
++                .filter((item) => requestedCategories.includes(item.id))
++                .map((item) => (
++                  <option key={item.id} value={item.id}>
++                    {item.name}
++                    {item.loaded ? ` (${item.count})` : ''}
++                  </option>
++                ))}
++            </select>
++            <Icon name="chev-d" size={18} />
++          </label>
++        </div>
++      </div>
++      {vod.isLoading ? <SkeletonRows rows={6} label="Abriendo catálogo de tu IPTV…" /> : null}
++      {vod.isError ? (
++        <EmptyState
++          title="No se pudo consultar el catálogo"
++          tone="error"
++          actions={
++            <Button icon="refresh" onClick={() => void vod.refetch()}>
++              Reintentar
++            </Button>
++          }
++        >
++          <p>{describeFailure(vod.error)}</p>
++          {isApiError(vod.error) ? (
++            <p>
++              Código: {vod.error.code}
++              {vod.error.requestId ? ` · Referencia: ${vod.error.requestId}` : ''}
++            </p>
++          ) : null}
++        </EmptyState>
++      ) : null}
++      {data?.loading ? (
++        <div className="vod__sync" role="status">
++          <strong>
++            Cargando categorías de{' '}
++            {parts
++              .filter((part) => part.progress?.status === 'loading')
++              .map((part) => part.label.toLocaleLowerCase('es'))
++              .join(' y ')}
++            …
++          </strong>
++          <p>
++            {plural(data.movies + data.series)} disponibles. Se están pidiendo categorías
++            seleccionadas, no el catálogo completo.
++          </p>
++          {parts
++            .filter(
++              (part) =>
++                (part.progress?.loadedCategories ?? 0) > 0 && part.progress?.status === 'loading',
++            )
++            .map((part) => (
++              <p key={part.kind}>
++                {part.label}: {part.progress?.loadedCategories} de {part.progress?.totalCategories}{' '}
++                categorías cargadas.
++              </p>
++            ))}
++        </div>
++      ) : null}
++      {parts
++        .filter((part) => part.progress?.error && part.progress.status !== 'loading')
++        .map((part) => (
++          <EmptyState
++            key={part.kind}
++            title={
++              part.progress?.status === 'partial'
++                ? `${part.label}: catálogo incompleto`
++                : `No se pudieron cargar ${part.label.toLocaleLowerCase('es')}`
++            }
++            tone="error"
++            actions={
++              <Button icon="refresh" disabled={data?.loading} onClick={reload}>
++                Reintentar carga
++              </Button>
++            }
++          >
++            <p>{part.progress?.error?.message}</p>
++            <p>
++              Código: {part.progress?.error?.code}
++              {part.progress?.error?.detail ? ` · ${part.progress.error.detail}` : ''}
++            </p>
++          </EmptyState>
++        ))}
++      {data?.active ? (
++        <p className="vod__count" aria-live="polite">
++          {plural(data.total)}
++          {data.loading || incomplete ? ' en lo cargado hasta ahora' : ' encontrados'} · Página{' '}
++          {Math.floor(offset / 60) + 1}
++        </p>
++      ) : null}
++      {data?.active && data.items.length ? (
++        <div className="vod__grid" aria-label="Películas y series de tu IPTV">
++          {data.items.map((item: IptvVodItem) => (
++            <Card as="article" key={item.id} padding={0} className="vod-card">
++              <VodArtwork kind={item.kind} title={item.title} posterId={item.posterId} />
++              <div className="vod-card__body">
++                <h2 title={item.title}>{item.title}</h2>
++                <MetadataLine year={item.year} rating={item.rating} genre={item.genre} compact />
++                {item.category ? (
++                  <p className="vod-card__category" title={item.category}>
++                    {item.category}
++                  </p>
++                ) : null}
++                <p className="vod-card__language">
++                  <Icon name="learn" size={16} />
++                  {languageName(item.language ?? preferences.assignments[item.categoryId] ?? null)}
++                </p>
++                {item.kind === 'series' ? (
++                  <Button variant="primary" icon="list" block onClick={() => setSeriesId(item.id)}>
++                    Ver serie y episodios
++                  </Button>
++                ) : (
++                  <div className="vod-card__buttons">
++                    <Button icon="learn" block onClick={() => setMovieId(item.id)}>
++                      Ficha
++                    </Button>
++                    <Button
++                      variant="primary"
++                      icon="play"
++                      block
++                      onClick={() =>
++                        openVideo({ id: item.id, title: item.title, extension: item.extension })
++                      }
++                    >
++                      Reproducir
++                    </Button>
++                  </div>
++                )}
++              </div>
++            </Card>
++          ))}
++        </div>
++      ) : null}
++      {data?.active && !data.loading && !incomplete && data.total === 0 ? (
++        <EmptyState title="No hay resultados" actions={null}>
++          Prueba con otro título, categoría o idioma. Si esperabas contenido, pulsa Actualizar
++          catálogo.
++        </EmptyState>
++      ) : null}
++      {data && !data.active ? (
++        <EmptyState title="Activa tu cuenta Xtream" actions={null}>
++          Configura la cuenta en Ajustes → IPTV para consultar sus películas y series.
++        </EmptyState>
++      ) : null}
++      {data?.active && data.total > 0 ? (
++        <div className="vod__pages">
++          <Button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 60))}>
++            Anterior
++          </Button>
++          <Button
++            disabled={data.nextOffset === null}
++            onClick={() => setOffset(data.nextOffset ?? offset)}
++          >
++            Siguiente
++          </Button>
++        </div>
++      ) : null}
++    </section>
++  );
++}
++
++function MetadataLine({
++  year,
++  rating,
++  genre,
++  compact = false,
++}: {
++  year: string | null;
++  rating: string | null;
++  genre: string | null;
++  compact?: boolean;
++}) {
++  const parts = [year, rating ? `★ ${rating}` : null, genre].filter(Boolean);
++  return parts.length ? (
++    <p className={`vod-card__metadata ${compact ? 'vod-card__metadata--compact' : ''}`}>
++      {parts.join(' · ')}
++    </p>
++  ) : null;
++}
+diff --git a/ace-player-neo/apps/web/src/features/pelis-series/pelis-series.css b/ace-player-neo/apps/web/src/features/pelis-series/pelis-series.css
+--- a/ace-player-neo/apps/web/src/features/pelis-series/pelis-series.css
++++ b/ace-player-neo/apps/web/src/features/pelis-series/pelis-series.css
+@@ -17,6 +17,250 @@
+   grid-template-columns: minmax(0, 1fr);
+   gap: var(--s-3);
+   align-items: end;
++}
++
++.vod__video {
++  width: 100%;
++  max-height: min(72vh, 800px);
++  background: #000;
++  border-radius: var(--r-m);
++}
++
++.vod__play-error {
++  color: var(--danger, #df766f);
++}
++
++.vod__episode,
++.vod__pages {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: var(--s-3);
++}
++
++.vod__episode p {
++  margin: var(--s-2) 0 0;
++}
++
++.vod__episode-title {
++  flex: 1;
++  min-width: 0;
++}
++
++.vod__setup {
++  display: grid;
++  gap: var(--s-4);
++  padding: clamp(16px, 4vw, 28px);
++}
++
++.vod__setup h2 {
++  margin: 0;
++  font-size: clamp(24px, 5vw, 34px);
++}
++
++.vod__setup p {
++  max-width: 72ch;
++  margin: var(--s-2) 0 0;
++  color: var(--text-2);
++  line-height: 1.5;
++}
++
++.vod__eyebrow {
++  color: var(--accent-ink) !important;
++  font-size: var(--fs-11);
++  font-weight: var(--wght-strong);
++  letter-spacing: 0.12em;
++}
++
++.vod__language-options {
++  display: grid;
++  grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr));
++  gap: 8px;
++}
++
++.vod__language-choice {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++  min-height: 48px;
++  padding: 10px 12px;
++  border: 1px solid var(--line-strong);
++  border-radius: var(--r-m);
++  background: var(--surface);
++  color: var(--text);
++  font-size: var(--fs-14);
++}
++
++.vod__language-choice input {
++  width: 19px;
++  height: 19px;
++  accent-color: var(--accent);
++}
++
++.vod__category-language {
++  border-top: 1px solid var(--line);
++  padding-top: var(--s-3);
++}
++
++.vod__category-language summary {
++  width: fit-content;
++  cursor: pointer;
++  font-weight: var(--wght-strong);
++}
++
++.vod__category-language-list {
++  display: grid;
++  gap: 8px;
++  max-height: 42vh;
++  overflow: auto;
++  margin-top: var(--s-3);
++}
++
++.vod__category-language-list label {
++  display: grid;
++  grid-template-columns: minmax(0, 1fr) minmax(170px, 0.65fr);
++  align-items: center;
++  gap: 12px;
++  padding: 8px 0;
++  border-bottom: 1px solid var(--line);
++}
++
++.vod__category-language-list label > span {
++  min-width: 0;
++  overflow-wrap: anywhere;
++}
++
++.vod__category-language-list small {
++  display: block;
++  margin-top: 3px;
++  color: var(--text-3);
++}
++
++.vod__category-language-list select {
++  min-height: 44px;
++  border: 1px solid var(--line-strong);
++  border-radius: var(--r-m);
++  padding: 0 10px;
++  background: var(--surface);
++  color: var(--text);
++  font: inherit;
++}
++
++.vod__metadata-note {
++  color: var(--text-2);
++  font-size: var(--fs-13);
++  line-height: 1.5;
++}
++
++.vod__details {
++  display: grid;
++  grid-template-columns: minmax(130px, 0.25fr) minmax(0, 1fr);
++  gap: var(--s-4);
++  padding: var(--s-4);
++}
++
++.vod__backdrop {
++  grid-column: 1 / -1;
++  width: 100%;
++  height: clamp(120px, 28vw, 220px);
++  border-radius: var(--r-m);
++  background: var(--surface-2);
++  object-fit: cover;
++}
++
++.vod__detail-poster {
++  width: 100%;
++  min-height: 220px;
++  aspect-ratio: 2 / 3;
++}
++
++.vod__detail-copy {
++  display: grid;
++  align-content: start;
++  gap: var(--s-2);
++  min-width: 0;
++}
++
++.vod__detail-copy h2,
++.vod__detail-copy p {
++  margin: 0;
++}
++
++.vod__detail-copy p {
++  color: var(--text-2);
++  line-height: 1.5;
++}
++
++.vod-card__poster {
++  position: absolute;
++  z-index: 0;
++  inset: 0;
++  width: 100%;
++  height: 100%;
++  border-radius: inherit;
++  background: var(--surface-2);
++  object-fit: cover;
++}
++
++.vod-card__art--loaded > svg,
++.vod-card__art--loaded .vod-card__initial {
++  display: none;
++}
++
++.vod-card__metadata {
++  margin: 0;
++  color: var(--text-2);
++  font-size: var(--fs-13);
++  line-height: 1.4;
++}
++
++.vod-card__metadata--compact {
++  display: -webkit-box;
++  overflow: hidden;
++  -webkit-box-orient: vertical;
++  -webkit-line-clamp: 2;
++}
++
++.vod-card__buttons {
++  display: grid;
++  grid-template-columns: 0.75fr 1fr;
++  gap: 8px;
++  margin-top: auto;
++}
++
++.vod__episode-poster {
++  flex: none;
++  width: 50px;
++  min-height: 72px;
++  aspect-ratio: 2 / 3;
++}
++
++.vod__episode-poster .vod-card__initial {
++  font-size: 32px;
++}
++
++.vod__episode-poster > svg {
++  width: 18px;
++  height: 18px;
++  right: 5px;
++  bottom: 5px;
++}
++
++@media (max-width: 599px) {
++  .vod__episode {
++    align-items: stretch;
++    flex-direction: column;
++  }
++  .vod__details {
++    grid-template-columns: minmax(90px, 0.32fr) minmax(0, 1fr);
++    gap: var(--s-3);
++  }
++  .vod__detail-poster {
++    min-height: 140px;
++  }
++  .vod__category-language-list label {
++    grid-template-columns: minmax(0, 1fr);
++  }
+ }
+ 
+ .vod__language {
+@@ -88,14 +332,22 @@
+   padding: 10px;
+   border-radius: var(--r-m);
+   background:
+-    radial-gradient(110% 90% at 100% 0%, color-mix(in oklab, var(--accent) 35%, transparent), transparent 72%),
++    radial-gradient(
++      110% 90% at 100% 0%,
++      color-mix(in oklab, var(--accent) 35%, transparent),
++      transparent 72%
++    ),
+     linear-gradient(150deg, var(--surface-2), var(--surface));
+   color: var(--accent-ink);
+ }
+ 
+ .vod-card__art--series {
+   background:
+-    radial-gradient(110% 90% at 0% 100%, color-mix(in oklab, var(--accent) 30%, transparent), transparent 72%),
++    radial-gradient(
++      110% 90% at 0% 100%,
++      color-mix(in oklab, var(--accent) 30%, transparent),
++      transparent 72%
++    ),
+     linear-gradient(35deg, var(--surface-2), var(--surface));
+ }
+ 
+@@ -196,3 +448,17 @@
+     grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+   }
+ }
++.vod__actions {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 12px;
++}
++
++.vod__sync {
++  padding-block: 16px;
++  overflow-wrap: anywhere;
++}
++
++.vod__sync p {
++  margin-block: 8px 0;
++}
+diff --git a/ace-player-neo/apps/web/src/features/library/ChannelRow.tsx b/ace-player-neo/apps/web/src/features/library/ChannelRow.tsx
+--- a/ace-player-neo/apps/web/src/features/library/ChannelRow.tsx
++++ b/ace-player-neo/apps/web/src/features/library/ChannelRow.tsx
+@@ -21,6 +21,7 @@
+ 
+ import type { LibraryCollection } from '@ace/shared';
+ import { useEffect, useId, useRef, type CSSProperties, type MouseEvent } from 'react';
++import { routeUrl } from '../../api/routes.ts';
+ import { cx } from '../../lib/cx.ts';
+ import { haptic } from '../../lib/haptics.ts';
+ import { teamCrest, teamPalette, teamShort } from '../../lib/teams.ts';
+@@ -48,6 +49,7 @@
+   category: string;
+   alias?: string | undefined;
+   ih: boolean;
++  iconId?: string | null | undefined;
+ }
+ 
+ export interface ChannelRowProps {
+@@ -262,7 +264,20 @@
+           bind.onContextMenu(event);
+         }}
+       >
+-        <ChannelMark name={title} shape="tile" size={36} className="ch__dorsal" />
++        <span className="ch__art">
++          <ChannelMark name={title} shape="tile" size={36} className="ch__dorsal" />
++          {item.iconId ? (
++            <img
++              className="ch__dorsal-logo"
++              src={routeUrl('iptvImage', { id: item.iconId })}
++              alt=""
++              loading="lazy"
++              onError={(event) => {
++                event.currentTarget.hidden = true;
++              }}
++            />
++          ) : null}
++        </span>
+         <span className="ch__body">
+           <span className="ch__name">
+             <span className="ch__name-text">{title}</span>
+diff --git a/ace-player-neo/apps/web/src/features/library/useChannelActions.tsx b/ace-player-neo/apps/web/src/features/library/useChannelActions.tsx
+--- a/ace-player-neo/apps/web/src/features/library/useChannelActions.tsx
++++ b/ace-player-neo/apps/web/src/features/library/useChannelActions.tsx
+@@ -39,6 +39,8 @@
+   title: string;
+   category: string;
+   ih: boolean;
++  /** Identificador opaco para descargar el logo local, si el proveedor lo ofrece. */
++  iconId?: string | null | undefined;
+   alias?: string | undefined;
+   /** El canal IPTV que es esta fila (igual a `id` si es un canal de «En tu IPTV»). */
+   iptv?: string | null | undefined;
+diff --git a/ace-player-neo/apps/web/src/features/library/LibraryView.tsx b/ace-player-neo/apps/web/src/features/library/LibraryView.tsx
+--- a/ace-player-neo/apps/web/src/features/library/LibraryView.tsx
++++ b/ace-player-neo/apps/web/src/features/library/LibraryView.tsx
+@@ -471,6 +471,7 @@
+               category: 'IPTV',
+               ih: false,
+               iptv: channel.id,
++              iconId: channel.iconId ?? null,
+             };
+             return (
+               <li key={channel.id} className="lib-row">
+diff --git a/ace-player-neo/apps/web/src/features/library/library.css b/ace-player-neo/apps/web/src/features/library/library.css
+--- a/ace-player-neo/apps/web/src/features/library/library.css
++++ b/ace-player-neo/apps/web/src/features/library/library.css
+@@ -161,6 +161,21 @@
+     inset 0 1px 0 rgb(255 255 255 / 0.22),
+     inset 0 0 0 1px rgb(0 0 0 / 0.12),
+     0 4px 12px -4px rgb(0 0 0 / 0.5);
++}
++.ch__art {
++  position: relative;
++  display: block;
++  width: 64px;
++  height: 36px;
++}
++.ch__dorsal-logo {
++  position: absolute;
++  inset: 0;
++  width: 64px;
++  height: 36px;
++  border-radius: 4px;
++  background: var(--surface);
++  object-fit: contain;
+ }
+ .ch__body {
+   display: grid;
+diff --git a/ace-player-neo/apps/web/src/features/library/iptv/IptvTab.tsx b/ace-player-neo/apps/web/src/features/library/iptv/IptvTab.tsx
+--- a/ace-player-neo/apps/web/src/features/library/iptv/IptvTab.tsx
++++ b/ace-player-neo/apps/web/src/features/library/iptv/IptvTab.tsx
+@@ -88,7 +88,14 @@
+ }
+ 
+ function rowOf(channel: IptvBrowseChannel): ActionableChannel & { iptv: string } {
+-  return { id: channel.id, title: channel.title, category: 'IPTV', ih: false, iptv: channel.id };
++  return {
++    id: channel.id,
++    title: channel.title,
++    category: 'IPTV',
++    ih: false,
++    iptv: channel.id,
++    iconId: channel.iconId ?? null,
++  };
+ }
+ 
+ export function IptvTab({ text, active, actions, onScreen, onAir, onCategoryName }: IptvTabProps) {
+diff --git a/ace-player-neo/apps/web/src/player/PlayerSurface.tsx b/ace-player-neo/apps/web/src/player/PlayerSurface.tsx
+--- a/ace-player-neo/apps/web/src/player/PlayerSurface.tsx
++++ b/ace-player-neo/apps/web/src/player/PlayerSurface.tsx
+@@ -15,8 +15,9 @@
+      en el móvil). En iPhone la pantalla completa es la del sistema, con sus
+      controles nativos (AirPlay incluido). Un solo reproductor visible: el
+      <video> nunca lleva `controls` (B-088, lo vigila index.tsx).
+-   - Se esconden a los 3,2 s sin mover el ratón SOLO si suena de verdad, y el
+-     cursor con ellos (B-102); con el dedo, un toque los enseña o los esconde.
++   - Se esconden tras 1,2 s sin mover el ratón mientras suena, y en 250 ms al
++     salir del reproductor; el cursor se va con ellos (B-102). Con el dedo,
++     un toque los enseña o los esconde.
+    - Ratón: un clic pausa o reanuda (espera 190 ms para distinguirlo del
+      doble clic, que pone pantalla completa); clic derecho, el menú propio.
+    - Móvil: deslizar hacia abajo sobre el vídeo lo minimiza. */
+@@ -41,7 +42,7 @@
+ import { Menu, MenuButton, useContextMenu } from '../ui/Menu.tsx';
+ import { Num } from '../ui/Num.tsx';
+ import { usePlayer, type PlayerState } from './api.ts';
+-import { CLICK_DELAY_MS, CONTROLS_HIDE_MS } from './constants.ts';
++import { CLICK_DELAY_MS, CONTROLS_HIDE_MS, CONTROLS_LEAVE_HIDE_MS } from './constants.ts';
+ import { usePlayerContext, type PlayerContextValue } from './context.ts';
+ import { NerdPanel } from './NerdPanel.tsx';
+ import { stageSlotStore } from './stage-slot.ts';
+@@ -213,25 +214,28 @@
+     hideTimer.current = null;
+   };
+ 
+-  const schedule = useCallback(() => {
+-    clearHide();
+-    if (!playing) return;
+-    const arm = () => {
+-      hideTimer.current = window.setTimeout(() => {
+-        // Con el foco del teclado dentro no se esconden (el foco se vería desaparecer).
+-        // Tampoco con el menú «Más opciones» abierto (se quedaría flotando solo).
+-        if (
+-          chromeRef.current?.contains(document.activeElement) ||
+-          chromeRef.current?.querySelector('[aria-expanded="true"]')
+-        ) {
+-          arm();
+-          return;
+-        }
+-        setChrome(false);
+-      }, CONTROLS_HIDE_MS);
+-    };
+-    arm();
+-  }, [playing]);
++  const schedule = useCallback(
++    (delayMs = CONTROLS_HIDE_MS) => {
++      clearHide();
++      if (!playing) return;
++      const arm = (waitMs: number) => {
++        hideTimer.current = window.setTimeout(() => {
++          // Con el foco del teclado dentro no se esconden (el foco se vería desaparecer).
++          // Tampoco con el menú «Más opciones» abierto (se quedaría flotando solo).
++          if (
++            chromeRef.current?.contains(document.activeElement) ||
++            chromeRef.current?.querySelector('[aria-expanded="true"]')
++          ) {
++            arm(CONTROLS_HIDE_MS);
++            return;
++          }
++          setChrome(false);
++        }, waitMs);
++      };
++      arm(delayMs);
++    },
++    [playing],
++  );
+ 
+   const wake = useCallback(() => {
+     setChrome(true);
+@@ -271,6 +275,9 @@
+   const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+     if (event.pointerType === 'mouse') wake();
+     contextMenu.bind.onPointerMove(event);
++  };
++  const onPointerLeave = (event: ReactPointerEvent<HTMLDivElement>) => {
++    if (event.pointerType === 'mouse') schedule(CONTROLS_LEAVE_HIDE_MS);
+   };
+   const onClick = () => {
+     if (lastPointer.current !== 'mouse') {
+@@ -319,6 +326,7 @@
+         data-chrome={chrome ? 'shown' : 'hidden'}
+         onPointerDown={onPointerDown}
+         onPointerMove={onPointerMove}
++        onPointerLeave={onPointerLeave}
+         onPointerUp={contextMenu.bind.onPointerUp}
+         onPointerCancel={contextMenu.bind.onPointerCancel}
+         onClick={onClick}
+@@ -360,6 +368,7 @@
+         onPointerMove={(event) => {
+           if (event.pointerType === 'mouse') wake();
+         }}
++        onPointerLeave={onPointerLeave}
+       >
+         <div className="player-chrome__top">
+           <div className="player-chrome__lead">
+diff --git a/ace-player-neo/apps/web/src/player/constants.ts b/ace-player-neo/apps/web/src/player/constants.ts
+--- a/ace-player-neo/apps/web/src/player/constants.ts
++++ b/ace-player-neo/apps/web/src/player/constants.ts
+@@ -61,8 +61,10 @@
+ /** Repintado de directo y colchón mientras suena (index.html:6042-6044). */
+ export const METER_MS = 500;
+ 
+-/** Controles: se esconden a los 3,2 s sin mover el ratón (solo si suena de verdad). */
+-export const CONTROLS_HIDE_MS = 3200;
++/** Controles: reposo breve antes de ocultarse mientras suena. */
++export const CONTROLS_HIDE_MS = 1200;
++/** Al sacar el ratón del reproductor, los controles se esconden casi enseguida. */
++export const CONTROLS_LEAVE_HIDE_MS = 250;
+ /** Clic simple frente a doble clic en el vídeo. */
+ export const CLICK_DELAY_MS = 190;
+ 
+diff --git a/ace-player-neo/apps/web/src/player/PlayerDock.test.tsx b/ace-player-neo/apps/web/src/player/PlayerDock.test.tsx
+--- a/ace-player-neo/apps/web/src/player/PlayerDock.test.tsx
++++ b/ace-player-neo/apps/web/src/player/PlayerDock.test.tsx
+@@ -190,7 +190,7 @@
+     });
+   });
+ 
+-  it('ratón: controles que se esconden a los 3,2 s solo si suena, clic que pausa a los 190 ms y doble clic a pantalla completa (B-102, B-088)', async () => {
++  it('ratón: controles que se esconden tras 1,2 s solo si suena, clic que pausa a los 190 ms y doble clic a pantalla completa (B-102, B-088)', async () => {
+     const requestFullscreen = vi.fn(async () => {});
+     Object.defineProperty(document, 'fullscreenEnabled', { configurable: true, value: true });
+     Object.defineProperty(document.documentElement, 'requestFullscreen', {
+@@ -206,9 +206,9 @@
+       setPlayer(playing({ phase: 'pausado', desiredPlaying: false }));
+       act(() => vi.advanceTimersByTime(10_000));
+       expect(chrome).toHaveAttribute('data-visible', 'true');
+-      // Sonando de verdad: a los 3,2 s sin mover el ratón, fuera.
++      // Sonando de verdad: a los 1,2 s sin mover el ratón, fuera.
+       setPlayer(playing());
+-      act(() => vi.advanceTimersByTime(3_100));
++      act(() => vi.advanceTimersByTime(1_100));
+       expect(chrome).toHaveAttribute('data-visible', 'true');
+       act(() => vi.advanceTimersByTime(200));
+       expect(chrome).toHaveAttribute('data-visible', 'false');
+@@ -256,7 +256,8 @@
+       phase: 'error',
+       conn: 'error',
+       idleReason: 'fallo',
+-      message: 'No se pudo recuperar esta señal tras varios intentos. Puede ser un corte temporal; vuelve a intentarlo o prueba otra señal.',
++      message:
++        'No se pudo recuperar esta señal tras varios intentos. Puede ser un corte temporal; vuelve a intentarlo o prueba otra señal.',
+     });
+     expect(screen.getByText('No se pudo abrir')).toBeInTheDocument();
+     expect(screen.getByText(/no se pudo recuperar esta señal/)).toBeInTheDocument();
+diff --git a/ace-player-neo/apps/web/src/player/README.md b/ace-player-neo/apps/web/src/player/README.md
+--- a/ace-player-neo/apps/web/src/player/README.md
++++ b/ace-player-neo/apps/web/src/player/README.md
+@@ -168,7 +168,8 @@
+   «Motor listo/apagado», «Canales n» (directorio + favoritos, sin repetir) y
+   «Hoy n partidos» (hoy en Madrid, no el día elegido: §29.14).
+ - **Interfaz**: controles propios (también en el móvil, como la maqueta); se
+-  esconden a los 3,2 s solo si suena de verdad; clic pausa, doble clic
++  esconden tras 1,2 s de inactividad y en 250 ms al salir del reproductor,
++  solo mientras suena de verdad; clic pausa, doble clic
+   pantalla completa, clic derecho menú; tocar enseña o esconde; deslizar hacia
+   abajo minimiza (móvil). Botón de directo B4. Toasts nunca sobre el vídeo: lo
+   de la señal va a la línea de estado (`notify(..., { kind: 'signal' })`).
+diff --git a/ace-player-neo/packages/shared/src/api/v1/iptv.ts b/ace-player-neo/packages/shared/src/api/v1/iptv.ts
+--- a/ace-player-neo/packages/shared/src/api/v1/iptv.ts
++++ b/ace-player-neo/packages/shared/src/api/v1/iptv.ts
+@@ -132,6 +132,108 @@
+ });
+ export type IptvView = z.infer<typeof IptvViewSchema>;
+ 
++/** Catálogo VOD de la cuenta Xtream. Los identificadores son opacos; ninguna respuesta lleva credenciales ni URL del proveedor. */
++export const IptvVodQuerySchema = z.strictObject({
++  /** Primero se cargan solo las categorías; los títulos se piden después de elegir idiomas. */
++  phase: z.enum(['categories', 'items']).default('categories'),
++  kind: z.enum(['todos', 'peliculas', 'series']).default('todos'),
++  q: z.string().max(120).default(''),
++  category: z.string().max(82).optional(),
++  /** Categorías Xtream elegidas para reducir la carga de títulos. */
++  categories: z
++    .array(z.string().regex(/^[ms]:[A-Za-z0-9_-]{1,80}$/))
++    .max(300)
++    .default([]),
++  language: z.string().max(40).optional(),
++  retry: z.string().max(40).optional(),
++  offset: z.coerce.number().int().min(0).max(100_000).default(0),
++  limit: z.coerce.number().int().min(1).max(100).default(60),
++});
++export type IptvVodQuery = z.infer<typeof IptvVodQuerySchema>;
++
++export const IptvVodItemSchema = z.strictObject({
++  id: HashSchema,
++  kind: z.enum(['peliculas', 'series']),
++  title: z.string().min(1).max(240),
++  category: z.string().max(200),
++  categoryId: z.string().max(82),
++  language: z.string().max(40).nullable(),
++  extension: z.string().max(8).nullable(),
++  posterId: HashSchema.nullable(),
++  year: z.string().max(12).nullable(),
++  rating: z.string().max(12).nullable(),
++  genre: z.string().max(160).nullable(),
++});
++export type IptvVodItem = z.infer<typeof IptvVodItemSchema>;
++
++export const IptvVodProgressSchema = z.strictObject({
++  status: z.enum(['idle', 'loading', 'ready', 'partial', 'error']),
++  loadedCategories: z.number().int().nonnegative(),
++  totalCategories: z.number().int().nonnegative(),
++  error: z
++    .strictObject({ code: z.string(), message: z.string(), detail: z.string().nullable() })
++    .nullable(),
++});
++export type IptvVodProgress = z.infer<typeof IptvVodProgressSchema>;
++
++export const IptvVodBrowseResponseSchema = z.strictObject({
++  active: z.boolean(),
++  loading: z.boolean(),
++  progress: z.strictObject({ peliculas: IptvVodProgressSchema, series: IptvVodProgressSchema }),
++  provider: z.string(),
++  total: z.number().int().nonnegative(),
++  movies: z.number().int().nonnegative(),
++  series: z.number().int().nonnegative(),
++  items: z.array(IptvVodItemSchema),
++  categories: z.array(
++    z.strictObject({
++      id: z.string(),
++      name: z.string(),
++      count: z.number().int().nonnegative(),
++      loaded: z.boolean(),
++      language: z.string().max(40).nullable(),
++    }),
++  ),
++  languages: z.array(z.string()),
++  nextOffset: z.number().int().nonnegative().nullable(),
++});
++export type IptvVodBrowseResponse = z.infer<typeof IptvVodBrowseResponseSchema>;
++
++export const IptvVodParamsSchema = z.strictObject({ id: HashSchema });
++export const IptvVodMovieResponseSchema = z.strictObject({
++  posterId: HashSchema.nullable(),
++  backdropId: HashSchema.nullable(),
++  year: z.string().max(12).nullable(),
++  rating: z.string().max(12).nullable(),
++  genre: z.string().max(160).nullable(),
++  plot: z.string().max(4000).nullable(),
++  director: z.string().max(300).nullable(),
++  cast: z.string().max(600).nullable(),
++});
++export type IptvVodMovieResponse = z.infer<typeof IptvVodMovieResponseSchema>;
++export const IptvVodEpisodeSchema = z.strictObject({
++  id: HashSchema,
++  title: z.string().min(1).max(240),
++  season: z.number().int().nonnegative(),
++  episode: z.number().int().nonnegative(),
++  extension: z.string().max(8),
++  posterId: HashSchema.nullable(),
++});
++export type IptvVodEpisode = z.infer<typeof IptvVodEpisodeSchema>;
++export const IptvVodSeriesResponseSchema = z.strictObject({
++  title: z.string().min(1).max(240),
++  posterId: HashSchema.nullable(),
++  year: z.string().max(12).nullable(),
++  rating: z.string().max(12).nullable(),
++  genre: z.string().max(160).nullable(),
++  plot: z.string().max(4000).nullable(),
++  director: z.string().max(300).nullable(),
++  cast: z.string().max(600).nullable(),
++  backdropId: HashSchema.nullable(),
++  episodes: z.array(IptvVodEpisodeSchema),
++});
++export type IptvVodSeriesResponse = z.infer<typeof IptvVodSeriesResponseSchema>;
++
+ /* --- Buscador: IPTV y AceStream juntos (docs/iptv.md §14.2) ---
+ 
+    `GET /api/v1/iptv/channels?q=` busca en el catálogo IPTV vigente. Nace con
+@@ -153,6 +255,8 @@
+   id: HashSchema,
+   /** Nombre limpio («Antena 3»): sin país, adornos, calidad ni reserva. */
+   title: z.string().min(1).max(120),
++  /** Id opaco que se sirve mediante la ruta local de imágenes; nunca una URL del proveedor. */
++  iconId: HashSchema.nullable().optional(),
+   /** Calidad de la variante del `id` (la que arranca primero: 1080p antes que 4K, 720p y SD). */
+   quality: IptvQualitySchema.nullable(),
+   /**
+@@ -259,6 +363,8 @@
+   id: HashSchema,
+   /** Nombre limpio («DAZN F1»): sin país, adornos, calidad ni reserva. */
+   title: z.string().min(1).max(120),
++  /** Id opaco que se sirve mediante la ruta local de imágenes; nunca una URL del proveedor. */
++  iconId: HashSchema.nullable().optional(),
+   /** Calidades de sus variantes, de mejor a peor para enseñar: uhd, fhd, hd, sd. Vacío = sin marca. */
+   qualities: z.array(IptvQualitySchema).max(IPTV_BROWSE_QUALITIES.length),
+   /** País deducido (§16.4), o null. */
+diff --git a/ace-player-neo/packages/shared/scripts/fixtures.ts b/ace-player-neo/packages/shared/scripts/fixtures.ts
+--- a/ace-player-neo/packages/shared/scripts/fixtures.ts
++++ b/ace-player-neo/packages/shared/scripts/fixtures.ts
+@@ -69,6 +69,9 @@
+   'iptvDelete',
+   'iptvChannels',
+   'iptvBrowse',
++  'iptvVodBrowse',
++  'iptvVodSeries',
++  'iptvVodMovie',
+ ] as const satisfies readonly JsonRouteId[];
+ export type WebFixtureRouteId = (typeof WEB_FIXTURE_ROUTE_IDS)[number];
+ /** Rutas con ejemplo en `v1/`. */
+@@ -684,6 +687,70 @@
+ 
+ export const WEB_V1_FIXTURES = {
+   iptvBrowse: iptvBrowseRoot,
++  iptvVodBrowse: {
++    active: true,
++    loading: false,
++    progress: {
++      peliculas: { status: 'ready', loadedCategories: 1, totalCategories: 1, error: null },
++      series: { status: 'ready', loadedCategories: 1, totalCategories: 1, error: null },
++    },
++    provider: 'Casa',
++    total: 1,
++    movies: 1,
++    series: 0,
++    items: [
++      {
++        id: HASH_A,
++        kind: 'peliculas',
++        title: 'Película de ejemplo',
++        category: 'Español',
++        categoryId: 'm:2',
++        language: 'es-ES',
++        extension: 'mp4',
++        posterId: null,
++        year: '2025',
++        rating: '7.8',
++        genre: 'Aventura',
++      },
++    ],
++    categories: [
++      { id: 'm:2', name: 'Español', count: 1, loaded: true, language: 'es-ES' },
++      { id: 's:2', name: 'Español', count: 0, loaded: true, language: 'es-ES' },
++    ],
++    languages: ['es-ES'],
++    nextOffset: null,
++  },
++  iptvVodSeries: {
++    title: 'Serie de ejemplo',
++    posterId: null,
++    year: '2024',
++    rating: '8.1',
++    genre: 'Drama',
++    plot: null,
++    director: null,
++    cast: null,
++    backdropId: null,
++    episodes: [
++      {
++        id: HASH_B,
++        title: 'Piloto',
++        season: 1,
++        episode: 1,
++        extension: 'mp4',
++        posterId: null,
++      },
++    ],
++  },
++  iptvVodMovie: {
++    posterId: null,
++    backdropId: null,
++    year: '2025',
++    rating: '7.8',
++    genre: 'Aventura',
++    plot: 'Sinopsis de ejemplo.',
++    director: null,
++    cast: null,
++  },
+   iptvChannels: {
+     query: 'la',
+     total: 3,
+diff --git a/ace-player-neo/packages/shared/src/routes.ts b/ace-player-neo/packages/shared/src/routes.ts
+--- a/ace-player-neo/packages/shared/src/routes.ts
++++ b/ace-player-neo/packages/shared/src/routes.ts
+@@ -97,6 +97,11 @@
+   IptvSaveBodySchema,
+   IptvUpdateBodySchema,
+   IptvViewSchema,
++  IptvVodBrowseResponseSchema,
++  IptvVodMovieResponseSchema,
++  IptvVodParamsSchema,
++  IptvVodQuerySchema,
++  IptvVodSeriesResponseSchema,
+ } from './api/v1/iptv.js';
+ import { SearchQuerySchema, SearchResponseSchema } from './api/v1/search.js';
+ import { SettingsResponseSchema, SettingsUpdateBodySchema } from './api/v1/settings.js';
+@@ -617,6 +622,81 @@
+     errors: [],
+     legacyTwin: null,
+   }),
++  iptvVodBrowse: defineRoute({
++    method: 'GET',
++    path: '/api/v1/iptv/vod',
++    access: 'web',
++    credential: 'bearer',
++    module: 'iptv',
++    summary: 'Películas y series de la cuenta Xtream, con búsqueda y filtros',
++    query: IptvVodQuerySchema,
++    response: IptvVodBrowseResponseSchema,
++    status: 200,
++    content: 'json',
++    sideEffects: false,
++    errors: [],
++    legacyTwin: null,
++  }),
++  iptvVodSeries: defineRoute({
++    method: 'GET',
++    path: '/api/v1/iptv/vod/series/:id',
++    access: 'web',
++    credential: 'bearer',
++    module: 'iptv',
++    summary: 'Temporadas y episodios de una serie Xtream',
++    params: IptvVodParamsSchema,
++    response: IptvVodSeriesResponseSchema,
++    status: 200,
++    content: 'json',
++    sideEffects: false,
++    errors: [],
++    legacyTwin: null,
++  }),
++  iptvVodMovie: defineRoute({
++    method: 'GET',
++    path: '/api/v1/iptv/vod/movie/:id',
++    access: 'web',
++    credential: 'bearer',
++    module: 'iptv',
++    summary: 'Metadatos de una película Xtream',
++    params: IptvVodParamsSchema,
++    response: IptvVodMovieResponseSchema,
++    status: 200,
++    content: 'json',
++    sideEffects: false,
++    errors: [],
++    legacyTwin: null,
++  }),
++  iptvVodVideo: defineRoute({
++    method: 'GET',
++    path: '/api/v1/iptv/vod/video/:id',
++    access: 'web',
++    credential: 'bearer',
++    module: 'iptv',
++    summary: 'Vídeo VOD a través del servidor local, con Range',
++    params: IptvVodParamsSchema,
++    response: null,
++    status: 200,
++    content: 'binary',
++    sideEffects: false,
++    errors: [],
++    legacyTwin: null,
++  }),
++  iptvImage: defineRoute({
++    method: 'GET',
++    path: '/api/v1/iptv/image/:id',
++    access: 'web',
++    credential: 'bearer',
++    module: 'iptv',
++    summary: 'Logo IPTV o carátula de VOD a través del servidor local',
++    params: IptvVodParamsSchema,
++    response: null,
++    status: 200,
++    content: 'binary',
++    sideEffects: false,
++    errors: [],
++    legacyTwin: null,
++  }),
+ 
+   // --- Emparejamiento y dispositivos ---
+   pairingCreate: defineRoute({
