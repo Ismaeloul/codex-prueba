@@ -1,0 +1,351 @@
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/service.ts b/ace-player-neo/apps/server/src/modules/iptv/service.ts
+index e34b52d..eb93a34 100644
+--- a/ace-player-neo/apps/server/src/modules/iptv/service.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/service.ts
+@@ -114,6 +114,7 @@ import { createIptvRelay, type IptvRelayImpl, type RelayVariant } from './relay.
+ import { IptvFiles } from './store.js';
+ import { xtreamMovieInfo, xtreamSeriesEpisodes, xtreamVodUrl } from './vod.js';
+ import { VodCatalog, emptyVodProgress } from './vod-catalog.js';
++import { createVodInputProxy } from './vod-input-proxy.js';
+ import type {
+   IptvCheckOptions,
+   IptvCheckResult,
+@@ -1851,26 +1852,22 @@ export class IptvServiceImpl implements IptvService {
+     this.vodStreams.add(controller);
+     const abort = () => controller.abort();
+     signal.addEventListener('abort', abort, { once: true });
+-    let opened: Awaited<ReturnType<IptvDeps['net']['openStream']>>;
+-    try {
+-      opened = await this.deps.net.openStream(url, {
+-        idleMs: direct ? 30_000 : 90_000,
+-        headers,
+-        iptv: this.policy(),
+-        signal: controller.signal,
+-      });
+-    } catch (error) {
+-      this.vodStreams.delete(controller);
+-      signal.removeEventListener('abort', abort);
+-      throw error;
+-    }
+-    reply.raw.once('close', () => {
+-      opened.body.destroy();
+-      controller.abort();
+-      this.vodStreams.delete(controller);
+-      signal.removeEventListener('abort', abort);
+-    });
+     if (!direct) {
++      let input: Awaited<ReturnType<typeof createVodInputProxy>>;
++      try {
++        input = await createVodInputProxy({
++          net: this.deps.net,
++          upstreamUrl: url,
++          headers,
++          iptv: this.policy(),
++          signal: controller.signal,
++          host: this.deps.relayHost,
++        });
++      } catch (error) {
++        this.vodStreams.delete(controller);
++        signal.removeEventListener('abort', abort);
++        throw error;
++      }
+       const ffmpeg = spawn(
+         'ffmpeg',
+         [
+@@ -1878,7 +1875,7 @@ export class IptvServiceImpl implements IptvService {
+           '-loglevel',
+           'error',
+           '-i',
+-          'pipe:0',
++          input.url,
+           '-map',
+           '0:v:0?',
+           '-map',
+@@ -1897,27 +1894,29 @@ export class IptvServiceImpl implements IptvService {
+           'frag_keyframe+empty_moov+default_base_moof',
+           'pipe:1',
+         ],
+-        { stdio: ['pipe', 'pipe', 'pipe'] },
++        { stdio: ['ignore', 'pipe', 'pipe'] },
+       );
+       let stderr = '';
+       ffmpeg.stderr.on('data', (chunk: Buffer) => {
+         if (stderr.length < 2_048) stderr += chunk.toString('utf8').slice(0, 2_048 - stderr.length);
+       });
+-      ffmpeg.stdin.on('error', () => opened.body.destroy());
+       ffmpeg.on('error', (error) => {
+-        opened.body.destroy();
++        input.close();
+         this.logger.warn(
+           { err: error, extension, mode: compatible ? 'compatible' : 'remux' },
+           'IPTV VOD: FFmpeg no pudo iniciar',
+         );
+       });
+-      opened.body.pipe(ffmpeg.stdin);
+       const close = () => {
+-        opened.body.destroy();
++        input.close();
++        controller.abort();
++        this.vodStreams.delete(controller);
++        signal.removeEventListener('abort', abort);
+         if (ffmpeg.exitCode === null && !ffmpeg.killed) ffmpeg.kill();
+       };
+       reply.raw.once('close', close);
+       signal.addEventListener('abort', close, { once: true });
++      ffmpeg.once('close', close);
+       try {
+         await waitForFfmpegOutput(ffmpeg, 20_000);
+       } catch (error) {
+@@ -1945,6 +1944,25 @@ export class IptvServiceImpl implements IptvService {
+       reply.send(ffmpeg.stdout);
+       return;
+     }
++    let opened: Awaited<ReturnType<IptvDeps['net']['openStream']>>;
++    try {
++      opened = await this.deps.net.openStream(url, {
++        idleMs: 30_000,
++        headers,
++        iptv: this.policy(),
++        signal: controller.signal,
++      });
++    } catch (error) {
++      this.vodStreams.delete(controller);
++      signal.removeEventListener('abort', abort);
++      throw error;
++    }
++    reply.raw.once('close', () => {
++      opened.body.destroy();
++      controller.abort();
++      this.vodStreams.delete(controller);
++      signal.removeEventListener('abort', abort);
++    });
+     const mime = extension === 'mp4' ? 'video/mp4' : 'video/webm';
+     reply
+       .code(opened.status)
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.test.ts b/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.test.ts
+new file mode 100644
+index 0000000..3202a4e
+--- /dev/null
++++ b/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.test.ts
+@@ -0,0 +1,78 @@
++import http from 'node:http';
++import { Readable } from 'node:stream';
++
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++import type { NetClient } from '../net/index.js';
++import { createVodInputProxy, type VodInputProxy } from './vod-input-proxy.js';
++
++const payload = Buffer.from('0123456789abcdefghijklmnopqrstuvwxyz');
++const proxies: VodInputProxy[] = [];
++
++afterEach(() => {
++  while (proxies.length) proxies.pop()?.close();
++});
++
++function request(url: string, range: string): Promise<{ status: number; body: string }> {
++  return new Promise((resolve, reject) => {
++    const req = http.get(url, { headers: { Range: range } }, (response) => {
++      const chunks: Buffer[] = [];
++      response.on('data', (chunk: Buffer) => chunks.push(chunk));
++      response.once('end', () =>
++        resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString() }),
++      );
++    });
++    req.once('error', reject);
++  });
++}
++
++describe('proxy local de entrada VOD', () => {
++  it('permite que ffmpeg pida varios rangos sin conocer la URL Xtream', async () => {
++    const openStream = vi.fn<NetClient['openStream']>(async (_url, options) => {
++      const range = options.headers?.Range ?? 'bytes=0-';
++      const match = /^bytes=(\d+)-(\d*)$/.exec(range);
++      const start = Number(match?.[1] ?? 0);
++      const end = match?.[2] ? Number(match[2]) : payload.length - 1;
++      const body = payload.subarray(start, end + 1);
++      return {
++        status: 206,
++        headers: {
++          'content-type': 'video/mp4',
++          'content-length': String(body.length),
++          'content-range': `bytes ${start}-${end}/${payload.length}`,
++          'accept-ranges': 'bytes',
++        },
++        contentType: 'video/mp4',
++        body: Readable.from(body),
++        finalUrl: 'https://proveedor.example/pelicula.mp4',
++      };
++    });
++    const controller = new AbortController();
++    const proxy = await createVodInputProxy({
++      net: { openStream } as unknown as NetClient,
++      upstreamUrl: 'https://proveedor.example/usuario/secreto/42.mp4',
++      headers: { 'User-Agent': 'Ace Player Neo' },
++      iptv: { lan: false },
++      signal: controller.signal,
++    });
++    proxies.push(proxy);
++
++    expect(proxy.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/input$/);
++    expect(proxy.url).not.toContain('usuario');
++    await expect(request(proxy.url, 'bytes=30-35')).resolves.toEqual({
++      status: 206,
++      body: 'uvwxyz',
++    });
++    await expect(request(proxy.url, 'bytes=0-3')).resolves.toEqual({ status: 206, body: '0123' });
++    expect(openStream).toHaveBeenNthCalledWith(
++      1,
++      'https://proveedor.example/usuario/secreto/42.mp4',
++      expect.objectContaining({ headers: expect.objectContaining({ Range: 'bytes=30-35' }) }),
++    );
++    expect(openStream).toHaveBeenNthCalledWith(
++      2,
++      'https://proveedor.example/usuario/secreto/42.mp4',
++      expect.objectContaining({ headers: expect.objectContaining({ Range: 'bytes=0-3' }) }),
++    );
++  });
++});
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.ts b/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.ts
+new file mode 100644
+index 0000000..af425f6
+--- /dev/null
++++ b/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.ts
+@@ -0,0 +1,137 @@
++import { createServer } from 'node:http';
++import type { AddressInfo } from 'node:net';
++import type { Readable } from 'node:stream';
++
++import type { IptvFetchPolicy } from '../net/types.js';
++import type { NetClient } from '../net/index.js';
++
++const RANGE = /^bytes=\d*-\d*(?:,\s*\d*-\d*)*$/;
++const FORWARDED_HEADERS = [
++  'content-type',
++  'content-length',
++  'content-range',
++  'accept-ranges',
++  'etag',
++  'last-modified',
++] as const;
++
++export interface VodInputProxy {
++  readonly url: string;
++  close(): void;
++}
++
++interface VodInputProxyOptions {
++  readonly net: NetClient;
++  readonly upstreamUrl: string;
++  readonly headers: Readonly<Record<string, string>>;
++  readonly iptv: IptvFetchPolicy;
++  readonly signal: AbortSignal;
++  readonly host?: '127.0.0.1' | '::1';
++}
++
++/**
++ * Proxy efímero, accesible solo por loopback, para que ffmpeg pueda pedir
++ * rangos de un VOD sin recibir la URL Xtream ni sus credenciales. Pasar un
++ * MP4 por stdin impide buscar su `moov` cuando está al final del archivo.
++ */
++export async function createVodInputProxy(options: VodInputProxyOptions): Promise<VodInputProxy> {
++  const host = options.host ?? '127.0.0.1';
++  const active = new Set<{ readonly controller: AbortController; body?: Readable }>();
++  let closed = false;
++
++  const server = createServer((request, response) => {
++    void (async () => {
++      if (closed || request.url !== '/input' || !['GET', 'HEAD'].includes(request.method ?? '')) {
++        response.statusCode = 404;
++        response.end();
++        return;
++      }
++
++      const controller = new AbortController();
++      const entry: { controller: AbortController; body?: Readable } = { controller };
++      active.add(entry);
++      const abort = () => controller.abort();
++      options.signal.addEventListener('abort', abort, { once: true });
++
++      const headers: Record<string, string> = { ...options.headers };
++      const range = request.headers.range;
++      if (typeof range === 'string' && range.length <= 200 && RANGE.test(range)) {
++        headers.Range = range;
++      }
++
++      const cleanup = () => {
++        options.signal.removeEventListener('abort', abort);
++        active.delete(entry);
++      };
++
++      try {
++        const opened = await options.net.openStream(options.upstreamUrl, {
++          idleMs: 90_000,
++          headers,
++          iptv: options.iptv,
++          signal: controller.signal,
++        });
++        entry.body = opened.body;
++        response.statusCode = opened.status;
++        for (const name of FORWARDED_HEADERS) {
++          const value = opened.headers[name];
++          if (typeof value === 'string' || Array.isArray(value)) response.setHeader(name, value);
++        }
++        response.setHeader('cache-control', 'private, no-store');
++
++        if (request.method === 'HEAD') {
++          opened.body.destroy();
++          response.end();
++          cleanup();
++          return;
++        }
++
++        response.once('close', () => {
++          opened.body.destroy();
++          controller.abort();
++          cleanup();
++        });
++        opened.body.once('error', () => response.destroy());
++        opened.body.once('end', cleanup);
++        opened.body.pipe(response);
++      } catch {
++        cleanup();
++        if (!response.headersSent) response.statusCode = 502;
++        response.end();
++      }
++    })();
++  });
++
++  server.on('clientError', (_error, socket) => socket.destroy());
++  await new Promise<void>((resolve, reject) => {
++    const onError = (error: Error) => reject(error);
++    server.once('error', onError);
++    server.listen(0, host, () => {
++      server.off('error', onError);
++      resolve();
++    });
++  });
++  server.unref();
++
++  const address = server.address() as AddressInfo | null;
++  if (!address) {
++    server.close();
++    throw new Error('vod_input_proxy_not_listening');
++  }
++  const displayHost = address.family === 'IPv6' ? `[${address.address}]` : address.address;
++
++  const close = () => {
++    if (closed) return;
++    closed = true;
++    for (const entry of active) {
++      entry.body?.destroy();
++      entry.controller.abort();
++    }
++    active.clear();
++    server.close();
++    server.closeAllConnections?.();
++  };
++  options.signal.addEventListener('abort', close, { once: true });
++
++  return { url: `http://${displayHost}:${address.port}/input`, close };
++}
