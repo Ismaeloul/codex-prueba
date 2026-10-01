@@ -1,0 +1,34 @@
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/service.ts b/ace-player-neo/apps/server/src/modules/iptv/service.ts
+index eb93a34..941f551 100644
+--- a/ace-player-neo/apps/server/src/modules/iptv/service.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/service.ts
+@@ -1920,14 +1920,25 @@ export class IptvServiceImpl implements IptvService {
+       try {
+         await waitForFfmpegOutput(ffmpeg, 20_000);
+       } catch (error) {
++        const detail = this.redact(stderr)
++          .replace(/https?:\/\/\S+/gi, '[url]')
++          .replace(/[\r\n\t]+/g, ' ')
++          .trim()
++          .slice(0, 180);
++        const exit = ffmpeg.exitCode ?? ffmpeg.signalCode ?? 'unknown';
+         close();
++        this.deps.bus.emit('diagnostics.report', {
++          cause: 'codec',
++          code: 'iptv_vod_ffmpeg',
++          message: `mode=${compatible ? 'compatible' : 'remux'}; ext=${extension}; exit=${exit}; ${detail || 'sin stderr'}`.slice(
++            0,
++            240,
++          ),
++        });
+         this.logger.warn(
+           {
+             err: new AppError('iptv_unsupported', {
+-              detail: stderr
+-                .replace(/[\r\n\t]+/g, ' ')
+-                .trim()
+-                .slice(0, 180),
++              detail,
+               cause: error,
+             }),
+             extension,
