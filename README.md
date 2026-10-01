@@ -14,16 +14,23 @@ Después instala **Ace Stream Neo V3 - Codex Prueba** desde esta tienda.
 
 La app de prueba usa el ID codex-prueba-ace-stream-neo, su propio directorio de datos de Umbrel y nombres de contenedor exclusivos. Su acceso web usa el puerto 7793 y el motor AceStream publica el puerto P2P 8623; la app original conserva sus puertos. No incluye bases de datos, listas IPTV, credenciales Xtream ni datos locales del usuario.
 
-**Estado de Pelis y Series:** la versión 0.8.9 carga películas y series de una cuenta Xtream configurada en Ajustes → IPTV. Antes de pedir títulos, enseña las categorías y permite elegir idiomas; distingue **Español (España)** de **Español latinoamericano**, recuerda la selección en ese navegador y deja editarla. Después consulta solo las categorías asignadas a esos idiomas. Permite buscar, filtrar por tipo/categoría/idioma y explorar episodios. Las carátulas, los logos y los metadatos Xtream (año, valoración, género, sinopsis, dirección y reparto) aparecen cuando el proveedor los publica; si falta una imagen, se ve el cartel genérico. Las imágenes las sirve el backend local y no se envían URL del proveedor al navegador. MP4 y WebM se sirven con Range; otros contenedores habituales se remuxean a MP4 y, si el códec sigue sin ser compatible, el reproductor ofrece conversión H.264. Los VOD HLS continúan sin soporte en esta versión.
+**Estado de Pelis y Series:** la versión 0.8.10 carga películas y series de una cuenta Xtream configurada en Ajustes → IPTV. Antes de pedir títulos, enseña las categorías y permite elegir idiomas; distingue **Español (España)** de **Español latinoamericano**, recuerda la selección en ese navegador y deja editarla. Después consulta solo las categorías asignadas a esos idiomas. Permite buscar, filtrar por tipo/categoría/idioma y explorar episodios. Las carátulas, los logos y los metadatos Xtream (año, valoración, género, sinopsis, dirección y reparto) aparecen cuando el proveedor los publica; si falta una imagen, se ve el cartel genérico. Las imágenes las sirve el backend local y no se envían URL del proveedor al navegador. MP4 y WebM se sirven con Range; otros contenedores habituales se remuxean a MP4 y, si el códec sigue sin ser compatible, el reproductor ofrece conversión H.264. Los VOD HLS continúan sin soporte en esta versión.
 
 El código fuente de esta actualización se puede revisar en [patches/v0.8.9-vod-playback-compat.patch](patches/v0.8.9-vod-playback-compat.patch). Es acumulativo y se aplica sobre `Ismaeloul/umbrel-app-store`, commit `28adf272bc32ed5eeb1626c618d31d110c35b5c6`, sin modificar la rama principal de la app original.
 
-## Actualización 0.8.9
+## Actualización 0.8.10
+
+- **Preparación en Umbrel:** corrige el YAML de Compose; en 0.8.9, los dos puntos del aviso de FFmpeg rompían la sintaxis del comando.
+- Incluye las correcciones de reproducción Xtream y diseño descritas abajo.
+
+## Actualización 0.8.9 (no instalar)
+
+- Esta versión contiene un error de sintaxis YAML en docker-compose.yml y Umbrel no puede prepararla. Usa 0.8.10.
 
 - **Reproducción Xtream:** admite más extensiones y deduce la extensión del nombre del episodio cuando el panel omite `container_extension`. MOV ahora pasa por ffmpeg; MKV y otros contenedores se remuxean a MP4. Si el navegador no acepta el códec, el usuario puede reintentar con conversión H.264.
 - **Errores más claros:** el servidor espera a que ffmpeg produzca datos antes de empezar la respuesta, y registra de forma acotada el motivo si termina antes.
 - **Diseño de episodios:** las miniaturas usan un marco 16:9 y conservan la proporción de la imagen; los títulos envuelven texto largo y los botones quedan dentro de sus tarjetas, también en móvil.
-- **Prueba real:** en Umbrel 0.8.8 se reprodujo el fallo con episodios MOV, MPEG y MKV de Mr. Robot. La versión 0.8.9 prepara las correcciones para repetir esa prueba.
+- **Prueba real:** en Umbrel 0.8.8 se reprodujo el fallo con episodios MOV, MPEG y MKV de Mr. Robot. La versión 0.8.10 prepara las correcciones para repetir esa prueba.
 
 ## Actualización 0.8.8
 
