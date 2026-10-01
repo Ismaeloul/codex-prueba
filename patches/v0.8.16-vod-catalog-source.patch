@@ -1,0 +1,59 @@
+diff --git a/apps/server/src/modules/iptv/vod.ts b/apps/server/src/modules/iptv/vod.ts
+index f3da597..0987da4 100644
+--- a/apps/server/src/modules/iptv/vod.ts
++++ b/apps/server/src/modules/iptv/vod.ts
+@@ -49,0 +50 @@ export interface RawVodItem {
++  readonly directUrl: string | null;
+@@ -173,0 +175 @@ export function vodPlayback(
++  const declaredExtension = stringOf(item.container_extension).toLowerCase().replace(/^\./, '');
+@@ -176 +178,6 @@ export function vodPlayback(
+-    extension: vodExtension(item.container_extension, item.name ?? item.title ?? fallbackExtension),
++    // Hay paneles que omiten container_extension en get_vod_info aunque sí lo
++    // publican en get_vod_streams. En ese caso conservar el dato del catálogo:
++    // inventar .mp4 hace que el panel responda 500 a una película realmente MKV.
++    extension: VOD_EXTENSIONS.has(declaredExtension)
++      ? declaredExtension
++      : safeVodExtension(fallbackExtension),
+@@ -286,0 +294 @@ export async function xtreamVodItems(
++          directUrl: safePlaybackUrl(item.direct_source, credentials.server),
+@@ -367,0 +376 @@ export async function xtreamMovieInfo(
++  fallbackExtension: string,
+@@ -392 +401 @@ export async function xtreamMovieInfo(
+-      playback: vodPlayback(movieData, movieId, 'mp4', credentials.server),
++      playback: vodPlayback(movieData, movieId, fallbackExtension, credentials.server),
+diff --git a/apps/server/src/modules/iptv/vod-catalog.ts b/apps/server/src/modules/iptv/vod-catalog.ts
+index 5475a47..2068764 100644
+--- a/apps/server/src/modules/iptv/vod-catalog.ts
++++ b/apps/server/src/modules/iptv/vod-catalog.ts
+@@ -259,0 +260 @@ export class VodCatalog {
++      directUrl: raw.directUrl,
+diff --git a/apps/server/src/modules/iptv/service.ts b/apps/server/src/modules/iptv/service.ts
+index efc8493..fe3d15a 100644
+--- a/apps/server/src/modules/iptv/service.ts
++++ b/apps/server/src/modules/iptv/service.ts
+@@ -1787,0 +1788 @@ export class IptvServiceImpl implements IptvService {
++      movie.extension ?? 'mp4',
+@@ -1797 +1798 @@ export class IptvServiceImpl implements IptvService {
+-      directUrl: info.playback.directUrl,
++      directUrl: info.playback.directUrl ?? movie.directUrl ?? null,
+@@ -1859,0 +1861 @@ export class IptvServiceImpl implements IptvService {
++          extension,
+@@ -1866 +1868 @@ export class IptvServiceImpl implements IptvService {
+-        directUrl = info.playback.directUrl;
++        directUrl = info.playback.directUrl ?? directUrl;
+diff --git a/apps/server/src/modules/iptv/vod.test.ts b/apps/server/src/modules/iptv/vod.test.ts
+index 54ad5ca..e056502 100644
+--- a/apps/server/src/modules/iptv/vod.test.ts
++++ b/apps/server/src/modules/iptv/vod.test.ts
+@@ -45,0 +46,11 @@ describe('extensiones Xtream VOD', () => {
++
++  it('conserva la extensión del catálogo cuando get_vod_info la omite', () => {
++    expect(
++      vodPlayback(
++        { stream_id: 777, name: 'Película sin extensión declarada' },
++        '123',
++        'mkv',
++        'https://iptv.example',
++      ),
++    ).toEqual({ sourceId: '777', extension: 'mkv', directUrl: null });
++  });
