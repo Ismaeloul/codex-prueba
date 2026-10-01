@@ -1,0 +1,167 @@
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/vod.ts b/ace-player-neo/apps/server/src/modules/iptv/vod.ts
+index 8d983d0..f3da597 100644
+--- a/ace-player-neo/apps/server/src/modules/iptv/vod.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/vod.ts
+@@ -62,2 +62,9 @@ export interface RawVodEpisode {
+   readonly posterUrl: string | null;
++  readonly directUrl: string | null;
++}
++
++export interface RawVodPlayback {
++  readonly sourceId: string;
++  readonly extension: string;
++  readonly directUrl: string | null;
+ }
+@@ -143,1 +150,31 @@ function safeImageUrl(value: unknown, base: string): string | null {
+ }
++
++function safePlaybackUrl(value: unknown, base: string): string | null {
++  const text = stringOf(value);
++  // eslint-disable-next-line no-control-regex
++  if (!text || text.length > 4096 || /[\u0000-\u001f\u007f]/.test(text)) return null;
++  try {
++    const url = new URL(text, base);
++    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password)
++      return null;
++    url.hash = '';
++    return url.toString();
++  } catch {
++    return null;
++  }
++}
++
++export function vodPlayback(
++  value: unknown,
++  fallbackId: string,
++  fallbackExtension: string,
++  base: string,
++): RawVodPlayback {
++  const item = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
++  const declaredId = stringOf(item.stream_id ?? item.id);
++  return {
++    sourceId: /^[A-Za-z0-9_-]{1,40}$/.test(declaredId) ? declaredId : fallbackId,
++    extension: vodExtension(item.container_extension, item.name ?? item.title ?? fallbackExtension),
++    directUrl: safePlaybackUrl(item.direct_source, base),
++  };
++}
+@@ -303,8 +340,7 @@ export async function xtreamSeriesEpisodes(
+         if (episodes.length >= MAX_EPISODES) throw new AppError('iptv_too_large');
+         episodes.push({
+-          sourceId,
++          ...vodPlayback(item, sourceId, vodExtension(item.container_extension, item.title), credentials.server),
+           title: (stringOf(item.title) || `Episodio ${episodes.length + 1}`).slice(0, 240),
+           season: numberOf(item.season || seasonKey),
+           episode: numberOf(item.episode_num) || episodes.length + 1,
+-          extension: vodExtension(item.container_extension, item.title),
+           posterUrl: safeImageUrl(
+@@ -333,1 +369,1 @@ export async function xtreamMovieInfo(
+-): Promise<RawVodMetadata> {
++): Promise<{ metadata: RawVodMetadata; playback: RawVodPlayback }> {
+@@ -350,2 +386,7 @@ export async function xtreamMovieInfo(
+-    if (!root.info || typeof root.info !== 'object') throw new Error('bad_response');
+-    return metadataOf(root.info, credentials.server);
++    const movieData =
++      root.movie_data && typeof root.movie_data === 'object' ? root.movie_data : undefined;
++    if ((!root.info || typeof root.info !== 'object') && !movieData) throw new Error('bad_response');
++    return {
++      metadata: metadataOf(root.info, credentials.server),
++      playback: vodPlayback(movieData, movieId, 'mp4', credentials.server),
++    };
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/vod-catalog.ts b/ace-player-neo/apps/server/src/modules/iptv/vod-catalog.ts
+index 8015bbd..5475a47 100644
+--- a/ace-player-neo/apps/server/src/modules/iptv/vod-catalog.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/vod-catalog.ts
+@@ -10,1 +10,2 @@ export interface VodRecord extends IptvVodItem {
+   readonly sourceId: string;
++  readonly directUrl?: string | null;
+@@ -52,1 +53,4 @@ export class VodCatalog {
+-  readonly episodes = new Map<string, { sourceId: string; extension: string }>();
++  readonly episodes = new Map<
++    string,
++    { sourceId: string; extension: string; directUrl: string | null }
++  >();
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/service.ts b/ace-player-neo/apps/server/src/modules/iptv/service.ts
+index 3fa411c..efc8493 100644
+--- a/ace-player-neo/apps/server/src/modules/iptv/service.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/service.ts
+@@ -1750,1 +1750,5 @@ export class IptvServiceImpl implements IptvService {
+-      state.episodes.set(episodeId, { sourceId: episode.sourceId, extension: episode.extension });
++      state.episodes.set(episodeId, {
++        sourceId: episode.sourceId,
++        extension: episode.extension,
++        directUrl: episode.directUrl,
++      });
+@@ -1780,1 +1784,1 @@ export class IptvServiceImpl implements IptvService {
+-    const metadata = await xtreamMovieInfo(
++    const info = await xtreamMovieInfo(
+@@ -1787,1 +1791,8 @@ export class IptvServiceImpl implements IptvService {
+     if (this.vodState !== state) throw new AppError('iptv_gone');
++    const metadata = info.metadata;
++    state.byId.set(id.toLowerCase(), {
++      ...movie,
++      sourceId: info.playback.sourceId,
++      extension: info.playback.extension,
++      directUrl: info.playback.directUrl,
++    });
+@@ -1840,4 +1851,27 @@ export class IptvServiceImpl implements IptvService {
+-    const sourceId = episode?.sourceId ?? movie?.sourceId ?? '';
+-    const extension = episode?.extension ?? movie?.extension ?? 'mp4';
++    let sourceId = episode?.sourceId ?? movie?.sourceId ?? '';
++    let extension = episode?.extension ?? movie?.extension ?? 'mp4';
++    let directUrl = episode?.directUrl ?? movie?.directUrl ?? null;
++    if (movie && !episode) {
++      try {
++        const info = await xtreamMovieInfo(
++          this.deps.net,
++          secrets,
++          movie.sourceId,
++          this.policy(),
++          signal,
++        );
++        if (this.vodState !== state) throw new AppError('iptv_gone');
++        sourceId = info.playback.sourceId;
++        extension = info.playback.extension;
++        directUrl = info.playback.directUrl;
++        state.byId.set(id.toLowerCase(), { ...movie, sourceId, extension, directUrl });
++      } catch (error) {
++        this.logger.debug(
++          { errorCode: errorCodeOf(error) },
++          'IPTV VOD: get_vod_info no aportó una ruta de reproducción',
++        );
++      }
++    }
+     if (extension === 'm3u8') throw new AppError('iptv_unsupported');
+-    const url = xtreamVodUrl(secrets, episode ? 'episode' : 'peliculas', sourceId, extension);
++    const url =
++      directUrl ?? xtreamVodUrl(secrets, episode ? 'episode' : 'peliculas', sourceId, extension);
+@@ -1937,1 +1971,1 @@ export class IptvServiceImpl implements IptvService {
+-          message: `mode=${compatible ? 'compatible' : 'remux'}; ext=${extension}; exit=${exit}; ${upstreamFailure}; ${detail || 'sin stderr'}`.slice(
++          message: `mode=${compatible ? 'compatible' : 'remux'}; source=${directUrl ? 'direct' : 'xtream'}; ext=${extension}; exit=${exit}; ${upstreamFailure}; ${detail || 'sin stderr'}`.slice(
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/vod.test.ts b/ace-player-neo/apps/server/src/modules/iptv/vod.test.ts
+index cc70aa4..54ad5ca 100644
+--- a/ace-player-neo/apps/server/src/modules/iptv/vod.test.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/vod.test.ts
+@@ -2,1 +2,1 @@
+-import { safeVodExtension, vodExtension, xtreamVodUrl } from './vod.js';
++import { safeVodExtension, vodExtension, vodPlayback, xtreamVodUrl } from './vod.js';
+@@ -26,1 +26,20 @@ describe('extensiones Xtream VOD', () => {
+   });
++
++  it('prefiere los datos de reproducción y direct_source de get_vod_info', () => {
++    expect(
++      vodPlayback(
++        {
++          stream_id: 777,
++          container_extension: 'mkv',
++          direct_source: 'https://cdn.example/vod/777?token=temporal',
++        },
++        '123',
++        'mp4',
++        'https://iptv.example',
++      ),
++    ).toEqual({
++      sourceId: '777',
++      extension: 'mkv',
++      directUrl: 'https://cdn.example/vod/777?token=temporal',
++    });
++  });

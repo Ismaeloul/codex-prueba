@@ -3,7 +3,7 @@ id: codex-prueba-ace-stream-neo
 category: media
 icon: "https://raw.githubusercontent.com/Ismaeloul/codex-prueba/main/codex-prueba-ace-stream-neo/icon.svg"
 name: Ace Stream Neo V3 - Codex Prueba
-version: "0.8.14"
+version: "0.8.15"
 tagline: Prueba aislada del reproductor AceStream y de Xtream Codes
 description: >-
   Tienda de prueba independiente para validar Ace Stream Neo V3 en Umbrel.
@@ -14,10 +14,10 @@ description: >-
   con reintento H.264 para los códecs que no admita el navegador.
   Usa una app ID, datos y contenedores separados del reproductor original.
 releaseNotes: >-
-  Versión 0.8.14: corrige los paneles Xtream que devuelven HTTP 500 ante la
-  petición inicial Range bytes=0- de FFmpeg. El proxy reintenta esa lectura sin
-  Range y mantiene el comportamiento normal en los proveedores compatibles.
-  Conserva el diagnóstico seguro y todos los arreglos de catálogo y diseño.
+  Versión 0.8.15: resuelve la reproducción con los datos reales de get_vod_info
+  y get_series_info. Usa el stream_id, contenedor y direct_source que indique el
+  proveedor para cada película o episodio, manteniendo las URLs y credenciales
+  dentro del backend. Conserva el fallback Range y el catálogo completo.
 developer: Ismaeloul
 website: https://github.com/Ismaeloul/codex-prueba
 dependencies: []
