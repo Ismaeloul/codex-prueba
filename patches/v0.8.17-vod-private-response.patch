@@ -1,0 +1,9 @@
+diff --git a/apps/server/src/modules/iptv/service.ts b/apps/server/src/modules/iptv/service.ts
+index fe3d15a..49e1bd8 100644
+--- a/apps/server/src/modules/iptv/service.ts
++++ b/apps/server/src/modules/iptv/service.ts
+@@ -1723 +1723,3 @@ export class IptvServiceImpl implements IptvService {
+-      items: page.map(({ sourceId: _sourceId, ...item }) => item),
++      // sourceId y directUrl son datos internos del proveedor. El navegador
++      // recibe únicamente el id opaco y los metadatos públicos del catálogo.
++      items: page.map(({ sourceId: _sourceId, directUrl: _directUrl, ...item }) => item),

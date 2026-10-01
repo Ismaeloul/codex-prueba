@@ -3,7 +3,7 @@ id: codex-prueba-ace-stream-neo
 category: media
 icon: "https://raw.githubusercontent.com/Ismaeloul/codex-prueba/main/codex-prueba-ace-stream-neo/icon.svg"
 name: Ace Stream Neo V3 - Codex Prueba
-version: "0.8.16"
+version: "0.8.17"
 tagline: Prueba aislada del reproductor AceStream y de Xtream Codes
 description: >-
   Tienda de prueba independiente para validar Ace Stream Neo V3 en Umbrel.
@@ -14,10 +14,9 @@ description: >-
   con reintento H.264 para los códecs que no admita el navegador.
   Usa una app ID, datos y contenedores separados del reproductor original.
 releaseNotes: >-
-  Versión 0.8.16: conserva el contenedor y direct_source de get_vod_streams cuando
-  get_vod_info los omite. Evita convertir por error un VOD MKV en una petición
-  .mp4 que el panel rechaza con HTTP 500. Mantiene las URLs y credenciales dentro
-  del backend y conserva el fallback Range.
+  Versión 0.8.17: conserva el contenedor y direct_source del proveedor solo en el
+  backend y excluye ambos identificadores privados de la respuesta pública del
+  catálogo. Corrige el internal_error aparecido al cargar Pelis y Series en 0.8.16.
 developer: Ismaeloul
 website: https://github.com/Ismaeloul/codex-prueba
 dependencies: []
