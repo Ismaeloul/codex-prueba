@@ -1,0 +1,80 @@
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.ts b/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.ts
+index 8720d1c..834f3a8 100644
+--- a/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.ts
+@@ -3,1 +3,2 @@
+ import type { Readable } from 'node:stream';
++import { errorCodeOf } from '../../core/errors.js';
+@@ -71,7 +72,23 @@ export async function createVodInputProxy(options: VodInputProxyOptions): Promis
+       try {
+-        const opened = await options.net.openStream(options.upstreamUrl, {
+-          idleMs: 90_000,
+-          headers,
+-          iptv: options.iptv,
+-          signal: controller.signal,
+-        });
++        let opened: Awaited<ReturnType<NetClient['openStream']>>;
++        try {
++          opened = await options.net.openStream(options.upstreamUrl, {
++            idleMs: 90_000,
++            headers,
++            iptv: options.iptv,
++            signal: controller.signal,
++          });
++        } catch (error) {
++          /* Algunos paneles Xtream responden 500 a `Range: bytes=0-`, que es
++             la primera petición de FFmpeg, aunque entregan el mismo archivo
++             correctamente sin Range. Reintentamos solo ese caso concreto. */
++          if (headers.Range !== 'bytes=0-' || errorCodeOf(error) !== 'http_500') throw error;
++          const retryHeaders = { ...headers };
++          delete retryHeaders.Range;
++          opened = await options.net.openStream(options.upstreamUrl, {
++            idleMs: 90_000,
++            headers: retryHeaders,
++            iptv: options.iptv,
++            signal: controller.signal,
++          });
++        }
+         entry.body = opened.body;
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.test.ts b/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.test.ts
+index 0e1eb2d..fefd2b6 100644
+--- a/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.test.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.test.ts
+@@ -101,1 +101,35 @@ describe('proxy local de entrada VOD', () => {
+-
++
++  it('reintenta sin Range cuando un panel Xtream rechaza bytes=0- con HTTP 500', async () => {
++    const openStream = vi.fn<NetClient['openStream']>(async (_url, options) => {
++      if (options.headers?.Range === 'bytes=0-') throw new Error('http_500');
++      return {
++        status: 200,
++        headers: {
++          'content-type': 'video/mp4',
++          'content-length': String(payload.length),
++        },
++        contentType: 'video/mp4',
++        body: Readable.from(payload),
++        finalUrl: 'https://proveedor.example/pelicula.mp4',
++      };
++    });
++    const onUpstreamError = vi.fn();
++    const controller = new AbortController();
++    const proxy = await createVodInputProxy({
++      net: { openStream } as unknown as NetClient,
++      upstreamUrl: 'https://proveedor.example/usuario/secreto/42.mp4',
++      headers: { 'User-Agent': 'Ace Player Neo' },
++      iptv: { lan: false },
++      signal: controller.signal,
++      onUpstreamError,
++    });
++    proxies.push(proxy);
++
++    await expect(request(proxy.url, 'bytes=0-')).resolves.toEqual({
++      status: 200,
++      body: payload.toString(),
++    });
++    expect(openStream).toHaveBeenCalledTimes(2);
++    expect(openStream.mock.calls[1]?.[1].headers).not.toHaveProperty('Range');
++    expect(onUpstreamError).not.toHaveBeenCalled();
++  });
+ });
