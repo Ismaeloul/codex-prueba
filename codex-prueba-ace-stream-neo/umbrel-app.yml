@@ -3,7 +3,7 @@ id: codex-prueba-ace-stream-neo
 category: media
 icon: "https://raw.githubusercontent.com/Ismaeloul/codex-prueba/main/codex-prueba-ace-stream-neo/icon.svg"
 name: Ace Stream Neo V3 - Codex Prueba
-version: "0.8.12"
+version: "0.8.13"
 tagline: Prueba aislada del reproductor AceStream y de Xtream Codes
 description: >-
   Tienda de prueba independiente para validar Ace Stream Neo V3 en Umbrel.
@@ -14,10 +14,10 @@ description: >-
   con reintento H.264 para los códecs que no admita el navegador.
   Usa una app ID, datos y contenedores separados del reproductor original.
 releaseNotes: >-
-  Versión 0.8.12: añade un diagnóstico redactado del fallo real de FFmpeg para
-  identificar por qué el proveedor corta películas o episodios. No guarda URLs,
-  usuario ni contraseña. Conserva la entrada local con Range de la 0.8.11 y todos
-  los arreglos de catálogo, metadatos, carátulas y diseño.
+  Versión 0.8.13: amplía el diagnóstico seguro del proxy VOD para identificar el
+  código upstream, método y rango exactos que hacen fallar el modo compatible.
+  No guarda URLs, usuario ni contraseña. Conserva la entrada local privada y
+  todos los arreglos de catálogo, metadatos, carátulas y diseño.
 developer: Ismaeloul
 website: https://github.com/Ismaeloul/codex-prueba
 dependencies: []

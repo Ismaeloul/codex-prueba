@@ -1,0 +1,93 @@
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/service.ts b/ace-player-neo/apps/server/src/modules/iptv/service.ts
+index 941f551..3fa411c 100644
+--- a/ace-player-neo/apps/server/src/modules/iptv/service.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/service.ts
+@@ -1854,6 +1854,7 @@ export class IptvServiceImpl implements IptvService {
+     signal.addEventListener('abort', abort, { once: true });
+     if (!direct) {
+       let input: Awaited<ReturnType<typeof createVodInputProxy>>;
++      let upstreamFailure = 'proxy=none';
+       try {
+         input = await createVodInputProxy({
+           net: this.deps.net,
+@@ -1862,6 +1863,9 @@ export class IptvServiceImpl implements IptvService {
+           iptv: this.policy(),
+           signal: controller.signal,
+           host: this.deps.relayHost,
++          onUpstreamError: (error, request) => {
++            upstreamFailure = `proxy=${errorCodeOf(error) ?? (error instanceof Error ? error.name : 'unknown')}; req=${request.method}; range=${request.range ?? 'none'}`;
++          },
+         });
+       } catch (error) {
+         this.vodStreams.delete(controller);
+@@ -1930,7 +1934,7 @@ export class IptvServiceImpl implements IptvService {
+         this.deps.bus.emit('diagnostics.report', {
+           cause: 'codec',
+           code: 'iptv_vod_ffmpeg',
+-          message: `mode=${compatible ? 'compatible' : 'remux'}; ext=${extension}; exit=${exit}; ${detail || 'sin stderr'}`.slice(
++          message: `mode=${compatible ? 'compatible' : 'remux'}; ext=${extension}; exit=${exit}; ${upstreamFailure}; ${detail || 'sin stderr'}`.slice(
+             0,
+             240,
+           ),
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.test.ts b/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.test.ts
+index 3202a4e..dea900c 100644
+--- a/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.test.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.test.ts
+@@ -75,4 +75,27 @@ describe('proxy local de entrada VOD', () => {
+       expect.objectContaining({ headers: expect.objectContaining({ Range: 'bytes=0-3' }) }),
+     );
+   });
++
++  it('informa de forma segura del fallo upstream y devuelve 502', async () => {
++    const failure = new Error('http_416');
++    const onUpstreamError = vi.fn();
++    const controller = new AbortController();
++    const proxy = await createVodInputProxy({
++      net: {
++        openStream: vi.fn<NetClient['openStream']>(async () => Promise.reject(failure)),
++      } as unknown as NetClient,
++      upstreamUrl: 'https://proveedor.example/usuario/secreto/42.mp4',
++      headers: { 'User-Agent': 'Ace Player Neo' },
++      iptv: { lan: false },
++      signal: controller.signal,
++      onUpstreamError,
++    });
++    proxies.push(proxy);
++
++    await expect(request(proxy.url, 'bytes=0-')).resolves.toEqual({ status: 502, body: '' });
++    expect(onUpstreamError).toHaveBeenCalledWith(failure, {
++      method: 'GET',
++      range: 'bytes=0-',
++    });
++  });
+ });
+diff --git a/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.ts b/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.ts
+index af425f6..8720d1c 100644
+--- a/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.ts
++++ b/ace-player-neo/apps/server/src/modules/iptv/vod-input-proxy.ts
+@@ -27,4 +27,8 @@ interface VodInputProxyOptions {
+   readonly iptv: IptvFetchPolicy;
+   readonly signal: AbortSignal;
+   readonly host?: '127.0.0.1' | '::1';
++  readonly onUpstreamError?: (
++    error: unknown,
++    request: { readonly method: 'GET' | 'HEAD'; readonly range?: string },
++  ) => void;
+ }
+@@ -94,7 +98,15 @@ export async function createVodInputProxy(options: VodInputProxyOptions): Promis
+         opened.body.once('error', () => response.destroy());
+         opened.body.once('end', cleanup);
+         opened.body.pipe(response);
+-      } catch {
++      } catch (error) {
++        try {
++          options.onUpstreamError?.(error, {
++            method: request.method === 'HEAD' ? 'HEAD' : 'GET',
++            ...(typeof range === 'string' ? { range } : {}),
++          });
++        } catch {
++          // El diagnóstico nunca debe impedir que el proxy cierre la respuesta.
++        }
+         cleanup();
+         if (!response.headersSent) response.statusCode = 502;
+         response.end();
